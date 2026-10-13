@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Bounds one supervise-dir sweep per cycle.
+const MAX_SERVICES_PER_SCAN: usize = 512;
+
 /// What a supervise directory says about a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerVerdict {
@@ -38,7 +41,7 @@ pub fn claims_map(svdir: &Path) -> HashMap<u32, (String, bool, u64)> {
     let Ok(entries) = fs::read_dir(svdir) else {
         return map;
     };
-    for entry in entries.flatten().take(512) {
+    for entry in entries.flatten().take(MAX_SERVICES_PER_SCAN) {
         let service = entry.file_name().to_string_lossy().into_owned();
         let pid_content =
             fs::read_to_string(entry.path().join("supervise/pid")).unwrap_or_default();
