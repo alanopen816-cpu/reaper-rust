@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.4.0-pilot — 2026-10-13 (branch `phase-pilot`, commits `a0402f3`+`a26e888`)
+
+Observation pilot, zero real closures. Dry-run everywhere outside lab tests.
+
+Added:
+- `queries.rs` — loopback-only broker GET (3 s timeout), bounded
+  `sv status` spawn+parse, meminfo swap, bounded dir sizing; loopback
+  enforced, unknown on unparseable (tested).
+- `evidence.rs` — owner-dead/last-client/no-work inputs, all
+  Unknown-defaulting; `proven()` conjunctive; rescue invalidates.
+- `pilot.rs` + CLI — `pilot report` (candidate table with evidence AND
+  limitations per row, zero signals), `pilot metrics`, real lifecycle
+  (`start` spawns detached observe, `status`, `stop` only verified-own
+  child, foreign-pidfile refusal tested).
+- Adapters: broker/runit real reads; OpenCode/Codex stay Unknown with
+  named missing interfaces (Unfit markers, never production-ready).
+- Tests: 67 unit + 2 integration (all 3× green runs observed), concurrency
+  (isolated + shared registries), grace-rescue, restart re-arm.
+
+Verified on-device: fmt, clippy `-D warnings`, release. Live: report over
+~60 real processes → **0 candidates** (all Blocked/Protected, honest);
+metrics RSS ~3.7 MiB, cycles 9–42 ms, swap 5.7/3.1 GiB, logs ~60 KiB;
+lifecycle start→status→stop roundtrip real; stale/foreign pidfiles
+refused. Independent verifier: 5 PASS + 1 real FAIL (fixed: start now
+spawns).
+
 ## v0.3.0-phase3 — 2026-10-13 (branch `phase-3`, commit `8323bfa`)
 
 Safe lab termination. Dry-run default; `--act` only for registry-verified
