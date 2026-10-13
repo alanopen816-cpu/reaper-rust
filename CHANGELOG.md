@@ -41,6 +41,24 @@ Verified on-device (Termux, ARM64, `rustc 1.98.1`):
 - Restart recovery live: `recovered=48 discarded_recycled=3`.
 - Signal audit: no `kill`, no `libc`, no `unsafe` in `src/`.
 
+## v0.2.1-phase2-closeout — 2026-10-13 (branch `phase-2`, commit `bea1d25`)
+
+- `procfs::scan_root()` + test con árbol falso (permiso denegado, basura,
+  PID cruzado, no-numéricos): 1 válido, 2 skipped_stat, 1 skipped_mismatch,
+  sin abortar.
+- `events`: test `ScanDegraded` emite el evento Y procesa los vivos del
+  mismo ciclo; el ciclo siguiente sigue normal.
+- `owner.rs` nuevo: claims desde `supervise/pid` + flag `down`, con
+  anti-reciclaje por starttime; cableado a `observe` (mapa por ciclo) e
+  `inspect`; `proven_abandoned` sigue `false` (down ⇒ observado, jamás
+  candidato). Tests: claim vivo, down vs activo, stale rechazado, basura y
+  svdir ausente sin pánico.
+- `identity`: `kernel_major_minor` + `pidfd_compat()` (release, header,
+  linked=false estructural) + tests de parser y de auto-consistencia viva.
+- Vivo: 39 tests, clippy limpio, release; runsv corroborado absoluto;
+  `supervise/pid` vacíos ⇒ correctamente sin claims; observe 6–12 ms,
+  RSS 3.7 MiB, CPU 0 ticks; reinicios previos recuperan estado.
+
 ## v0.1.0-phase1 — baseline (tag `phase-1`)
 
 Read-only observer: `scan | inspect | observe`, 5 unit tests, ~2.9 MiB
