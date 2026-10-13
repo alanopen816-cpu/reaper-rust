@@ -1,0 +1,8 @@
+[package]
+name = "reaper"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only Termux process observer and daily audit logger"
+license = "MIT"
+
+[dependencies]
