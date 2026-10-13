@@ -1,22 +1,27 @@
-//! Reaper phase 2: observable supervisor. Still sends NO signals.
+//! Reaper supervisor. Signals are possible only via `close --act` for a
+//! registry-verified lab PID after the full evidence and close sequence.
 //!
 //! `scan` prints one verified snapshot, `inspect <pid>` explains a single
 //! process (identity, relations, protection, policy), `observe [secs]`
 //! runs the event + state-machine + policy loop with daily JSONL logs.
-//! Termination is impossible by construction: no signalling code exists in
-//! this binary (see adapters: every shutdown request is declined by value).
+//! Observer and scan paths remain read-only; production processes are never
+//! eligible for the lab-only close path.
 
 mod adapters;
 mod events;
+mod evidence;
 mod identity;
+mod lab;
 mod logx;
 mod owner;
+mod pidfd;
 mod policy;
 mod procfs;
 mod protection;
 mod relations;
 mod state;
 mod stats;
+mod terminate;
 
 use adapters::{Codex, GenericLinux, Liveness, McpBroker, OpenCode, OwnerAdapter, RunitService};
 use events::{Event, Tracker};
@@ -49,9 +54,11 @@ fn adapter_for(name: &str, exe: &str) -> Box<dyn OwnerAdapter> {
         });
     }
     if n.contains("opencode") || exe.contains("/opencode") {
+        let _mode = OpenCode::classify(exe);
         return Box::new(OpenCode);
     }
     if n.contains("codex") || exe.contains("/codex") {
+        let _daemon = Codex::classify(exe);
         return Box::new(Codex);
     }
     if exe.contains("/mcp") || n.contains("mcp") {
@@ -187,6 +194,8 @@ fn cmd_inspect(pid: u32) -> io::Result<()> {
         rel.groups.get(&p.pgrp).map(Vec::len).unwrap_or(0)
     );
     println!("pidfd: {}", identity::pidfd_status());
+    let _self_pidfd = pidfd::open_self().and_then(pidfd::close);
+    let _self_probe = pidfd::probe_self_empty();
     let compat = identity::pidfd_compat();
     println!(
         "pidfd_compat: kernel={} supports={} header={} linked={}",
@@ -353,9 +362,29 @@ impl Observer {
                     "unclaimed".to_string(),
                 ),
             };
+            let lab_member = lab::current_registry()
+                .unwrap_or_default()
+                .iter()
+                .any(|e| e.pid == p.pid && e.start_ticks == p.start_ticks);
+            let owner_evidence = match owner::resolve(&claims, p) {
+                owner::OwnerVerdict::ClaimedActive { service } => {
+                    owner::OwnerVerdict::ClaimedActive { service }
+                }
+                owner::OwnerVerdict::ClaimedDown { service } => {
+                    owner::OwnerVerdict::ClaimedDown { service }
+                }
+                owner::OwnerVerdict::Unclaimed => owner::OwnerVerdict::Unclaimed,
+            };
+            let ev = evidence::AbandonEvidence {
+                lab_member,
+                owner: owner_evidence,
+                grace_expired: false,
+                revalidated_now: false,
+            };
+            let _absence = evidence::positive_vs_absent(&ev);
             let signals = Signals {
                 owner_reports_active: owner_active,
-                proven_abandoned: false, // Phase 2: no evidence source can prove abandonment yet.
+                proven_abandoned: evidence::proven(&ev),
                 needs_tolerance: false,
                 memory_pressure: false,
             };
@@ -459,6 +488,102 @@ impl Observer {
     }
 }
 
+fn cmd_lab() -> io::Result<()> {
+    let child = lab::spawn(false)?;
+    println!(
+        "lab_spawned pid={} start_ticks={} registry={}",
+        child.id(),
+        child.entry.start_ticks,
+        lab::registry_path_current().display()
+    );
+    std::mem::forget(child);
+    Ok(())
+}
+
+fn cmd_close(pid: u32, act: bool) -> io::Result<()> {
+    let Some(entry) = lab::current_registry()?.into_iter().find(|e| e.pid == pid) else {
+        println!("close receipt: refused; PID is not in lab registry; no signal");
+        return Ok(());
+    };
+    let Some(current) = lab::identity_ticks(pid).ok() else {
+        println!("close receipt: refused; PID is gone; no signal");
+        return Ok(());
+    };
+    if current != entry.start_ticks {
+        println!("close receipt: refused; identity changed; no signal");
+        return Ok(());
+    }
+    let evidence = evidence::AbandonEvidence {
+        lab_member: true,
+        owner: owner::OwnerVerdict::Unclaimed,
+        grace_expired: logx::now_secs() >= entry.spawned_at.saturating_add(300),
+        revalidated_now: true,
+    };
+    if !evidence::proven(&evidence) {
+        println!("close receipt: refused; evidence={evidence:?} proven=false; no signal");
+        return Ok(());
+    }
+    let policy = terminate::ClosePolicy::default();
+    let rec = terminate::LabRecord {
+        pid,
+        start_ticks: entry.start_ticks,
+        spawned_at: entry.spawned_at,
+    };
+    if !act {
+        for receipt in terminate::close_sequence(
+            &rec,
+            &policy,
+            false,
+            &mut terminate::PidfdSignaller,
+            |pid, ticks, spawned| {
+                lab::registry_contains(&lab::Entry {
+                    pid,
+                    start_ticks: ticks,
+                    spawned_at: spawned,
+                })
+                .unwrap_or(false)
+                    && lab::identity_ticks(pid).ok() == Some(ticks)
+            },
+            |_| {},
+            || "dry-run; official shutdown not invoked".into(),
+        ) {
+            println!("close receipt: {receipt}");
+        }
+        return Ok(());
+    }
+    let Some(p) = procfs::scan().processes.into_iter().find(|p| p.pid == pid) else {
+        println!("close receipt: refused; PID is gone; no signal");
+        return Ok(());
+    };
+    let mut s = terminate::PidfdSignaller;
+    for receipt in terminate::close_sequence(
+        &rec,
+        &policy,
+        true,
+        &mut s,
+        |pid, ticks, spawned| {
+            lab::registry_contains(&lab::Entry {
+                pid,
+                start_ticks: ticks,
+                spawned_at: spawned,
+            })
+            .unwrap_or(false)
+                && lab::identity_ticks(pid).ok() == Some(ticks)
+        },
+        thread::sleep,
+        || {
+            format!(
+                "{:?}",
+                adapter_for(&p.name, &p.command)
+                    .request_official_shutdown(&identity::identify(&p, identity::read_boot_id()))
+            )
+        },
+    ) {
+        println!("close receipt: {receipt}");
+    }
+    Ok(())
+}
+
 fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
     let log_cfg = logx::LogConfig::new(state_dir.join("logs"));
     let boot_id = identity::read_boot_id();
@@ -484,7 +609,7 @@ fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
         "Reaper observer phase-2: read-only, interval={interval}s, logs={}",
         state_dir.display()
     );
-    println!("No signals will ever be sent by this build.");
+    println!("Signals are possible only via close --act for registry-verified lab PIDs.");
     let mut obs = Observer {
         tracker: Tracker::new(boot_id),
         supervisor,
@@ -510,6 +635,21 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let state_dir = logx::default_state_dir();
     let result = match args.get(1).map(String::as_str) {
+        Some("lab") => cmd_lab(),
+        Some("close") => {
+            let pid = args
+                .iter()
+                .position(|a| a == "--pid")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse::<u32>().ok());
+            match pid {
+                Some(pid) => cmd_close(pid, args.iter().any(|a| a == "--act")),
+                None => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Usage: close --pid PID [--act]",
+                )),
+            }
+        }
         Some("scan") => cmd_scan(),
         Some("inspect") => match args.get(2).and_then(|s| s.parse::<u32>().ok()) {
             Some(pid) => cmd_inspect(pid),
@@ -526,7 +666,7 @@ fn main() {
         _ => {
             println!("Reaper v0.2.0-phase2 (observable supervisor, still read-only)");
             println!("Usage: reaper scan | inspect <PID> | observe [interval_seconds]");
-            println!("Never sends signals; READY_FOR_REVALIDATION performs no action.");
+            println!("Signals are possible only via close --act for registry-verified lab PIDs.");
             Ok(())
         }
     };

@@ -28,6 +28,7 @@ pub enum Liveness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shutdown {
     DeclinedPhase2 { reason: String },
+    Prepared { command: String },
 }
 
 pub trait OwnerAdapter {
@@ -102,6 +103,20 @@ impl OwnerAdapter for McpBroker {
 
 /// Shared OpenCode server: endpoint presence proves nothing about clients.
 pub struct OpenCode;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeMode {
+    Shared,
+    Standalone,
+}
+impl OpenCode {
+    pub fn classify(fixture: &str) -> OpenCodeMode {
+        if fixture.contains("server") || fixture.contains("--hostname") {
+            OpenCodeMode::Shared
+        } else {
+            OpenCodeMode::Standalone
+        }
+    }
+}
 impl OwnerAdapter for OpenCode {
     fn name(&self) -> &'static str {
         "opencode"
@@ -110,12 +125,22 @@ impl OwnerAdapter for OpenCode {
         Liveness::Unknown
     }
     fn request_official_shutdown(&self, id: &ProcessIdentity) -> Shutdown {
-        declined(id, "opencode service stop (user-only)")
+        Shutdown::Prepared {
+            command: format!(
+                "service stop opencode pid={} start={}",
+                id.pid, id.start_ticks
+            ),
+        }
     }
 }
 
 /// Codex app-server daemon: version/socket proves responsiveness, not idleness.
 pub struct Codex;
+impl Codex {
+    pub fn classify(fixture: &str) -> bool {
+        fixture.contains("app-server") || fixture.contains("daemon")
+    }
+}
 impl OwnerAdapter for Codex {
     fn name(&self) -> &'static str {
         "codex"
@@ -124,7 +149,9 @@ impl OwnerAdapter for Codex {
         Liveness::Unknown
     }
     fn request_official_shutdown(&self, id: &ProcessIdentity) -> Shutdown {
-        declined(id, "codex app-server daemon stop (user-only)")
+        Shutdown::Prepared {
+            command: format!("daemon stop pid={} start={}", id.pid, id.start_ticks),
+        }
     }
 }
 
@@ -158,11 +185,20 @@ mod tests {
             assert!(
                 matches!(
                     a.request_official_shutdown(&id()),
-                    Shutdown::DeclinedPhase2 { .. }
+                    Shutdown::DeclinedPhase2 { .. } | Shutdown::Prepared { .. }
                 ),
                 "{}",
                 a.name()
             );
         }
+    }
+    #[test]
+    fn adapter_fixture_classification_and_unknown_clients() {
+        assert_eq!(OpenCode::classify("opencode server"), OpenCodeMode::Shared);
+        assert_eq!(OpenCode::classify("opencode run"), OpenCodeMode::Standalone);
+        assert!(Codex::classify("codex app-server"));
+        assert!(!Codex::classify("codex exec"));
+        assert_eq!(OpenCode.liveness(&id()), Liveness::Unknown);
+        assert_eq!(Codex.liveness(&id()), Liveness::Unknown);
     }
 }
