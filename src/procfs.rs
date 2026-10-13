@@ -82,10 +82,17 @@ pub struct ScanOutcome {
 }
 
 pub fn scan() -> ScanOutcome {
+    scan_root(std::path::Path::new("/proc"))
+}
+
+/// Same scan against an alternate proc-style root. Production calls it with
+/// `/proc`; tests point it at a fixture tree to exercise the real skipping
+/// path (unreadable stat, garbage, PID mismatch) instead of a helper.
+pub fn scan_root(root: &std::path::Path) -> ScanOutcome {
     let mut processes = Vec::new();
     let mut skipped_stat = 0;
     let mut skipped_mismatch = 0;
-    let Ok(entries) = fs::read_dir("/proc") else {
+    let Ok(entries) = fs::read_dir(root) else {
         return ScanOutcome {
             processes,
             skipped_stat,
@@ -177,5 +184,45 @@ mod tests {
             .iter()
             .any(|p| p.pid == std::process::id());
         assert!(self_seen, "own process must be visible");
+    }
+
+    #[test]
+    fn permission_denied_and_garbage_never_abort_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("reaper-fakeproc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // Valid entry.
+        let good = root.join("1234");
+        fs::create_dir_all(&good).unwrap();
+        let filler = vec!["0"; 15].join(" ");
+        fs::write(
+            good.join("stat"),
+            format!("1234 (good) S 1 1 1 {filler} 10"),
+        )
+        .unwrap();
+        fs::write(good.join("status"), "Uid:\t10373\nVmRSS:\t100 kB\n").unwrap();
+        fs::write(good.join("cmdline"), b"good\0--secret-arg\0").unwrap();
+        // Unreadable stat (simulated permission error on the real path).
+        let locked = root.join("9999");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("stat"), "9999 (x) S 1 1 1 0").unwrap();
+        fs::set_permissions(locked.join("stat"), fs::Permissions::from_mode(0o000)).unwrap();
+        // Garbage stat.
+        let bad = root.join("7777");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("stat"), "not a stat line").unwrap();
+        // PID mismatch (directory 5555, stat claims 4444).
+        let mixed = root.join("5555");
+        fs::create_dir_all(&mixed).unwrap();
+        fs::write(mixed.join("stat"), format!("4444 (m) S 1 1 1 {filler} 10")).unwrap();
+        // Non-numeric entries are ignored silently.
+        fs::create_dir_all(root.join("self")).unwrap();
+
+        let outcome = scan_root(&root);
+        assert_eq!(outcome.processes.len(), 1);
+        assert_eq!(outcome.processes[0].command, "good");
+        assert_eq!(outcome.skipped_stat, 2);
+        assert_eq!(outcome.skipped_mismatch, 1);
+        let _ = fs::remove_dir_all(&root);
     }
 }

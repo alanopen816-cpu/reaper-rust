@@ -10,6 +10,7 @@ mod adapters;
 mod events;
 mod identity;
 mod logx;
+mod owner;
 mod policy;
 mod procfs;
 mod protection;
@@ -186,6 +187,13 @@ fn cmd_inspect(pid: u32) -> io::Result<()> {
         rel.groups.get(&p.pgrp).map(Vec::len).unwrap_or(0)
     );
     println!("pidfd: {}", identity::pidfd_status());
+    let compat = identity::pidfd_compat();
+    println!(
+        "pidfd_compat: kernel={} supports={} header={} linked={}",
+        compat.osrelease, compat.kernel_supports, compat.header_present, compat.linked
+    );
+    let claims = owner::claims_map(&owner::default_svdir());
+    println!("owner_claim={:?}", owner::resolve(&claims, p));
     Ok(())
 }
 
@@ -283,6 +291,10 @@ impl Observer {
             }
         }
 
+        // Owner claims are rebuilt once per cycle from supervise dirs
+        // (pure file reads, no spawns, no signals).
+        let claims = owner::claims_map(&owner::default_svdir());
+
         for p in &outcome.processes {
             let id = identity::identify(p, self.boot_id.clone());
             // Recycled PID under a live tracking key: prior state is void.
@@ -325,8 +337,24 @@ impl Observer {
             }
             let prot = protect(p, self_pid, &rel, uid);
             let adapter = adapter_for(&p.name, &p.command);
+            // Owner verdict refines the adapter's Unknown: a live supervise
+            // claim means the owner considers it up; a down-claim means the
+            // owner parked it (watched, never candidate — proven_abandoned
+            // stays false in this phase).
+            let (owner_active, owner_tag) = match owner::resolve(&claims, p) {
+                owner::OwnerVerdict::ClaimedActive { service } => {
+                    (Some(true), format!("runit:{service}"))
+                }
+                owner::OwnerVerdict::ClaimedDown { service } => {
+                    (Some(false), format!("runit:{service}:down"))
+                }
+                owner::OwnerVerdict::Unclaimed => (
+                    liveness_to_signal(adapter.liveness(&id)),
+                    "unclaimed".to_string(),
+                ),
+            };
             let signals = Signals {
-                owner_reports_active: liveness_to_signal(adapter.liveness(&id)),
+                owner_reports_active: owner_active,
                 proven_abandoned: false, // Phase 2: no evidence source can prove abandonment yet.
                 needs_tolerance: false,
                 memory_pressure: false,
@@ -384,7 +412,7 @@ impl Observer {
                     &id,
                     next,
                     now,
-                    "scan+policy",
+                    &format!("scan+policy owner={owner_tag}"),
                     "policy-engine",
                     &format!("{decision:?}"),
                 );

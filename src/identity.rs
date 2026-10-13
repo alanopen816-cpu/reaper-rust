@@ -56,6 +56,48 @@ pub fn pidfd_status() -> &'static str {
     "not-linked(zero-dep); fallback=double-revalidation via (pid,start_ticks,uid)"
 }
 
+/// Parse `VERSION.RELEASE...` into (major, minor). Pure and unit-tested.
+pub fn kernel_major_minor(osrelease: &str) -> Option<(u32, u32)> {
+    let mut parts = osrelease.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor: u32 = parts
+        .next()?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((major, minor))
+}
+
+/// True when the kernel predates nothing we need: pidfd needs ≥ 5.3.
+fn kernel_supports(major: u32, minor: u32) -> bool {
+    major > 5 || (major == 5 && minor >= 3)
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PidfdCompat {
+    pub osrelease: String,
+    pub kernel_supports: bool,
+    pub header_present: bool,
+    pub linked: bool,
+}
+
+pub fn pidfd_compat() -> PidfdCompat {
+    let osrelease = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let osrelease = osrelease.trim().to_owned();
+    let kernel_supports =
+        kernel_major_minor(&osrelease).is_some_and(|(maj, min)| kernel_supports(maj, min));
+    let header = std::env::var("PREFIX")
+        .map(|p| format!("{p}/include/sys/pidfd.h"))
+        .unwrap_or_else(|_| "/data/data/com.termux/files/usr/include/sys/pidfd.h".into());
+    PidfdCompat {
+        osrelease,
+        kernel_supports,
+        header_present: std::path::Path::new(&header).exists(),
+        linked: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +150,29 @@ mod tests {
         let s = pidfd_status();
         assert!(s.contains("not-linked"));
         assert!(s.contains("double-revalidation"));
+    }
+
+    #[test]
+    fn kernel_version_parser() {
+        assert_eq!(
+            kernel_major_minor("5.10.240-android12-9-00006"),
+            Some((5, 10))
+        );
+        assert_eq!(kernel_major_minor("6.1.0"), Some((6, 1)));
+        assert_eq!(kernel_major_minor("4.14"), Some((4, 14)));
+        assert_eq!(kernel_major_minor("garbage"), None);
+        assert_eq!(kernel_major_minor(""), None);
+    }
+
+    #[test]
+    fn live_compat_report_is_self_consistent() {
+        // Environment-conditional by design: asserts internal consistency of
+        // the live report on ANY machine, not absolute availability.
+        let r = pidfd_compat();
+        assert!(!r.linked, "phase-2 never links pidfd");
+        assert_eq!(
+            r.kernel_supports,
+            kernel_major_minor(&r.osrelease).is_some_and(|(maj, min)| kernel_supports(maj, min))
+        );
     }
 }

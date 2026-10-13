@@ -178,4 +178,34 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e, Event::StateChanged { .. })));
         assert!(evs.iter().any(|e| matches!(e, Event::Disappeared { .. })));
     }
+
+    #[test]
+    fn degraded_scan_still_reports_and_continues() {
+        // A cycle with unreadable entries must emit ScanDegraded AND still
+        // process the live processes in the same diff (no halt, no silence).
+        let mut t = Tracker::new(None);
+        let live = proc(40, 1, 400, 'S');
+        let o = ScanOutcome {
+            processes: vec![live],
+            skipped_stat: 2,
+            skipped_mismatch: 1,
+        };
+        let evs = t.diff(&o, &o.processes);
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            Event::ScanDegraded {
+                skipped_stat: 2,
+                skipped_mismatch: 1
+            }
+        )));
+        assert!(evs.iter().any(|e| matches!(e, Event::Appeared { .. })));
+        // Next clean cycle proceeds normally (tracker state intact).
+        let o2 = ScanOutcome {
+            processes: vec![],
+            skipped_stat: 0,
+            skipped_mismatch: 0,
+        };
+        let evs2 = t.diff(&o2, &o2.processes);
+        assert!(evs2.iter().any(|e| matches!(e, Event::Disappeared { .. })));
+    }
 }
