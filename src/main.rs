@@ -1,133 +1,509 @@
-//! Reaper phase 1: observations only. Absolutely no signal-sending code.
-use std::{collections::{BTreeMap, HashMap}, env, fs::{self, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
+//! Reaper phase 2: observable supervisor. Still sends NO signals.
+//!
+//! `scan` prints one verified snapshot, `inspect <pid>` explains a single
+//! process (identity, relations, protection, policy), `observe [secs]`
+//! runs the event + state-machine + policy loop with daily JSONL logs.
+//! Termination is impossible by construction: no signalling code exists in
+//! this binary (see adapters: every shutdown request is declined by value).
 
-#[derive(Debug, Clone)]
-struct Process {
-    pid: u32, ppid: u32, start_ticks: u64, state: char,
-    name: String, command: String, rss_kib: u64, swap_kib: u64, uid: Option<u32>,
+mod adapters;
+mod events;
+mod identity;
+mod logx;
+mod policy;
+mod procfs;
+mod protection;
+mod relations;
+mod state;
+mod stats;
+
+use adapters::{Codex, GenericLinux, Liveness, McpBroker, OpenCode, OwnerAdapter, RunitService};
+use events::{Event, Tracker};
+use policy::{Decision, Policy, Signals};
+use protection::{protect, Tier};
+use relations::Relations;
+use state::{State, Supervisor};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+fn own_uid() -> Option<u32> {
+    fs::read_to_string("/proc/self/status").ok().and_then(|c| {
+        c.lines()
+            .find(|l| l.starts_with("Uid:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|x| x.parse().ok())
+    })
 }
-fn parse_stat(input: &str) -> Option<(u32, String, char, u32, u64)> {
-    // comm can contain spaces and ')' (including nested parentheses). Find the LAST ')'.
-    let l = input.find('(')?;
-    let r = input.rfind(')')?;
-    let pid = input[..l].trim().parse().ok()?;
-    let name = input[l+1..r].to_owned();
-    let fields: Vec<&str> = input[r+1..].split_whitespace().collect();
-    // after comm: state=field 3/index 0, ppid=field 4/index 1, starttime=field 22/index 19
-    if fields.len() < 20 { return None; }
-    Some((pid, name, fields[0].chars().next()?, fields[1].parse().ok()?, fields[19].parse().ok()?))
-}
-fn status_numbers(path: &Path) -> (Option<u32>, u64, u64) {
-    let Ok(content) = fs::read_to_string(path) else { return (None, 0, 0) };
-    let mut uid = None;
-    let mut rss = 0;
-    let mut swap = 0;
-    for line in content.lines() {
-        if let Some(v) = line.strip_prefix("Uid:") { uid = v.split_whitespace().next().and_then(|x| x.parse().ok()); }
-        if let Some(v) = line.strip_prefix("VmRSS:") { rss = v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0); }
-        if let Some(v) = line.strip_prefix("VmSwap:") { swap = v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0); }
+
+fn adapter_for(name: &str, exe: &str) -> Box<dyn OwnerAdapter> {
+    let n = name.to_ascii_lowercase();
+    if n == "runsvdir" || n == "runsv" || n == "svlogd" {
+        return Box::new(RunitService {
+            service_name: name.to_owned(),
+        });
     }
-    (uid, rss, swap)
-}
-fn scan() -> Vec<Process> {
-    let mut result = Vec::new();
-    let Ok(entries) = fs::read_dir("/proc") else { return result };
-    for entry in entries.flatten() {
-        let Some(pid) = entry.file_name().to_string_lossy().parse::<u32>().ok() else { continue };
-        let path = entry.path();
-        let Ok(stat) = fs::read_to_string(path.join("stat")) else { continue };
-        let Some((real_pid, name, state, ppid, start_ticks)) = parse_stat(&stat) else { continue };
-        if real_pid != pid { continue; }
-        let (uid, rss_kib, swap_kib) = status_numbers(&path.join("status"));
-        let command = fs::read(path.join("cmdline")).map(|v| {
-            let mut args = v.split(|b| *b == 0).filter(|s| !s.is_empty());
-            let first = args.next().map(|x| String::from_utf8_lossy(x).into_owned()).unwrap_or_else(|| name.clone());
-            // Deliberately omit arguments: they can contain secrets.
-            first
-        }).unwrap_or_else(|_| name.clone());
-        result.push(Process{ pid, ppid, start_ticks, state, name, command, rss_kib, swap_kib, uid });
+    if n.contains("opencode") || exe.contains("/opencode") {
+        return Box::new(OpenCode);
     }
-    result.sort_by_key(|p| p.pid);
-    result
+    if n.contains("codex") || exe.contains("/codex") {
+        return Box::new(Codex);
+    }
+    if exe.contains("/mcp") || n.contains("mcp") {
+        return Box::new(McpBroker);
+    }
+    Box::new(GenericLinux)
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Class { Critical, Session, Managed, Unknown }
-impl Class { fn as_str(self) -> &'static str { match self { Self::Critical=>"critical", Self::Session=>"session", Self::Managed=>"managed-protected", Self::Unknown=>"unknown-protected" } } }
-fn classify(p: &Process, self_pid: u32) -> Class {
-    let name = p.name.to_ascii_lowercase();
-    let exe = p.command.to_ascii_lowercase();
-    if p.pid == self_pid || ["runsvdir", "runsv", "svlogd", "com.termux", "adbd"].contains(&name.as_str()) ||
-        name.starts_with("com.termux:") || name == "reaper" { return Class::Critical; }
-    if ["zsh", "bash", "fish", "sh", "tmux", "login"].contains(&name.as_str()) { return Class::Session; }
-    if ["opencode", "codex", "codex.bin", "engram", "node", "python", "python3", "serena", "hound", "dbus-daemon", "sshd", "ssh-agent"].contains(&name.as_str()) ||
-        exe.contains("/opencode") || exe.contains("/codex") || exe.contains("/serena") || exe.contains("/codegraph") || exe.contains("/rea-") { return Class::Managed; }
-    Class::Unknown
+
+fn liveness_to_signal(l: Liveness) -> Option<bool> {
+    match l {
+        Liveness::Alive => Some(true),
+        Liveness::Dead => Some(false),
+        Liveness::Unknown => None,
+    }
 }
-fn quote_json(raw: &str) -> String {
-    let mut result = String::from("\"");
-    for c in raw.chars() { match c { '\"' => result.push_str("\\\""), '\\' => result.push_str("\\\\"), '\n'=>result.push_str("\\n"), '\r'=>result.push_str("\\r"), '\t'=>result.push_str("\\t"), c if c.is_control()=> result.push_str(&format!("\\u{:04x}", c as u32)), c=>result.push(c) } }
-    result.push('"'); result
-}
-fn now_secs() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
-fn civil_date(days: i64) -> (i64, i64, i64) {
-    // Gregorian civil-from-days. UTC naming avoids TZ assumptions.
-    let z=days+719468; let era=if z>=0 {z} else {z-146096}/146097;
-    let doe=z-era*146097; let yoe=(doe-doe/1460+doe/36524-doe/146096)/365;
-    let mut y=yoe+era*400; let doy=doe-(365*yoe+yoe/4-yoe/100);
-    let mp=(5*doy+2)/153; let d=doy-(153*mp+2)/5+1;
-    let m=mp+if mp<10 {3} else {-9}; if m<=2 {y+=1}; (y,m,d)
-}
-fn default_state_dir() -> PathBuf {
-    if let Ok(v) = env::var("XDG_STATE_HOME") { if !v.is_empty() { return PathBuf::from(v).join("reaper"); } }
-    PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state/reaper")
-}
-fn log_event(state_dir: &Path, event: &str, detail: &str) -> io::Result<()> {
-    let time = now_secs(); let (y,m,d) = civil_date((time/86400) as i64);
-    let dir=state_dir.join("logs"); fs::create_dir_all(&dir)?;
-    let path=dir.join(format!("{:04}-{:02}-{:02}.jsonl",y,m,d));
-    let mut f=OpenOptions::new().append(true).create(true).open(path)?;
-    writeln!(f, "{{\"time_unix\":{},\"event\":{},\"detail\":{}}}",time,quote_json(event),quote_json(detail))
-}
-fn render(processes: &[Process]) {
-    println!("{:>7} {:>7} {:>9} {:>9} {:>9} {:<18} {}", "PID", "PPID", "RSS KiB", "Swap KiB", "START", "CLASS", "NAME");
-    let self_pid=std::process::id();
-    for p in processes { println!("{:>7} {:>7} {:>9} {:>9} {:>9} {:<18} {}",p.pid,p.ppid,p.rss_kib,p.swap_kib,p.start_ticks, classify(p,self_pid).as_str(), p.name); }
-}
-fn observe(interval: u64, state_dir: &Path) -> io::Result<()> {
-    log_event(state_dir,"observer.started","read_only=true")?;
-    let mut previous: HashMap<u32,u64> = HashMap::new();
-    loop {
-        let current=scan(); let current_map: HashMap<u32,u64> = current.iter().map(|p|(p.pid,p.start_ticks)).collect();
-        let mut counts=BTreeMap::<&str,usize>::new();
-        for p in &current {
-            let class=classify(p,std::process::id()).as_str(); *counts.entry(class).or_default()+=1;
-            if previous.get(&p.pid)!=Some(&p.start_ticks) {
-                log_event(state_dir,"process.observed",&format!("pid={} start={} class={} name={}",p.pid,p.start_ticks,class,p.name))?;
+
+fn decide_state(decision: &Decision, current: Option<State>) -> State {
+    match decision {
+        Decision::KeepProtected { tier, .. } => match tier {
+            Tier::Absolute | Tier::Unknown => State::Protected,
+            // Contextual shared or known-with-active-clients: hands off but
+            // kept under watch (non-terminal) so rescue/idle flips re-evaluate.
+            Tier::Contextual | Tier::Known => State::Observing,
+        },
+        Decision::Observe { .. } => State::Observing,
+        Decision::GraceCandidate { .. } => State::GracePeriod,
+        Decision::ReadyForRevalidation { .. } => State::ReadyForRevalidation,
+        Decision::Blocked { .. } => {
+            // A blocked process that was already terminally protected stays put.
+            if current == Some(State::Protected) {
+                State::Protected
+            } else {
+                State::TerminationBlocked
             }
         }
-        for (pid,start) in &previous { if current_map.get(pid)!=Some(start) { log_event(state_dir,"process.disappeared",&format!("pid={} start={}",pid,start))?; } }
-        let overview=counts.iter().map(|(k,v)| format!("{}={}",k,v)).collect::<Vec<_>>().join(" ");
-        println!("{} observed={} {}",now_secs(),current.len(),overview);
-        previous=current_map;
+    }
+}
+
+fn render_scan(processes: &[procfs::Process], rel: &Relations, uid: Option<u32>) {
+    println!(
+        "{:>7} {:>7} {:>9} {:>9} {:>9} {:<12} NAME",
+        "PID", "PPID", "RSS KiB", "Swap KiB", "START", "TIER"
+    );
+    let self_pid = std::process::id();
+    for p in processes {
+        let tier = match protect(p, self_pid, rel, uid).tier {
+            Tier::Absolute => "absolute",
+            Tier::Contextual => "contextual",
+            Tier::Known => "known",
+            Tier::Unknown => "unknown",
+        };
+        println!(
+            "{:>7} {:>7} {:>9} {:>9} {:>9} {:<12} {}",
+            p.pid, p.ppid, p.rss_kib, p.swap_kib, p.start_ticks, tier, p.name
+        );
+    }
+}
+
+fn cmd_scan() -> io::Result<()> {
+    let outcome = procfs::scan();
+    let rel = relations::build(&outcome.processes);
+    render_scan(&outcome.processes, &rel, own_uid());
+    println!(
+        "Observed {} processes ({} skipped), {} sessions, {} groups, {} watchdog hints (inferred only). READ ONLY — no signals sent.",
+        outcome.processes.len(),
+        outcome.skipped_stat + outcome.skipped_mismatch,
+        rel.sessions.len(),
+        rel.groups.len(),
+        rel.watchdogs.len()
+    );
+    println!("relations_evidence={:?}", rel.evidence);
+    Ok(())
+}
+
+fn cmd_inspect(pid: u32) -> io::Result<()> {
+    let outcome = procfs::scan();
+    let Some(p) = outcome.processes.iter().find(|p| p.pid == pid) else {
+        eprintln!("PID not visible");
+        return Ok(());
+    };
+    let rel = relations::build(&outcome.processes);
+    let self_pid = std::process::id();
+    let uid = own_uid();
+    let prot = protect(p, self_pid, &rel, uid);
+    let adapter = adapter_for(&p.name, &p.command);
+    let live = adapter.liveness(&identity::identify(p, identity::read_boot_id()));
+    let signals = Signals {
+        owner_reports_active: liveness_to_signal(live),
+        proven_abandoned: false,
+        needs_tolerance: false,
+        memory_pressure: false,
+    };
+    let decision = policy::decide(&Policy::default(), &prot, p, &signals);
+    let node = rel.nodes.get(&pid);
+    println!(
+        "pid={} ppid={} pgrp={} session={} start_ticks={} state={} uid={:?}",
+        p.pid, p.ppid, p.pgrp, p.session, p.start_ticks, p.state, p.uid
+    );
+    println!(
+        "name={} executable={} rss_kib={} swap_kib={}",
+        p.name, p.command, p.rss_kib, p.swap_kib
+    );
+    println!("protection={:?} reason={}", prot.tier, prot.reason);
+    println!(
+        "owner_adapter={} liveness={:?} shutdown={:?}",
+        adapter.detail(),
+        live,
+        adapter.request_official_shutdown(&identity::identify(p, identity::read_boot_id()))
+    );
+    println!("decision={:?}", decision);
+    if let Some(n) = node {
+        println!(
+            "node pid={} pgrp={} session={} children={:?} visible_children={} parent_missing={} evidence={:?}",
+            n.pid,
+            n.pgrp,
+            n.session,
+            n.children,
+            relations::has_visible_children(&rel, pid),
+            n.parent_missing,
+            n.evidence
+        );
+    }
+    let hints: Vec<String> = rel
+        .watchdogs
+        .iter()
+        .filter(|w| w.pid == pid || w.for_pid == pid)
+        .map(|w| format!("pid={} for={} evidence={:?}", w.pid, w.for_pid, w.evidence))
+        .collect();
+    println!("watchdog_hints={hints:?} (inferred only, never proof)");
+    println!(
+        "session_members={} group_members={}",
+        rel.sessions.get(&p.session).map(Vec::len).unwrap_or(0),
+        rel.groups.get(&p.pgrp).map(Vec::len).unwrap_or(0)
+    );
+    println!("pidfd: {}", identity::pidfd_status());
+    Ok(())
+}
+
+struct Observer {
+    tracker: Tracker,
+    supervisor: Supervisor,
+    policy: Policy,
+    log_cfg: logx::LogConfig,
+    boot_id: Option<String>,
+    usage_start: stats::SelfUsage,
+}
+
+impl Observer {
+    fn cycle(&mut self) -> io::Result<stats::CycleStats> {
+        let mut st = stats::CycleStats::new();
+        let outcome = procfs::scan();
+        st.inspected = outcome.processes.len();
+        st.skipped = outcome.skipped_stat + outcome.skipped_mismatch;
+        let rel = relations::build(&outcome.processes);
+        let self_pid = std::process::id();
+        let uid = own_uid();
+        let now = logx::now_secs();
+
+        for ev in self.tracker.diff(&outcome, &outcome.processes) {
+            st.events += 1;
+            match &ev {
+                Event::Appeared { identity } => {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "process.appeared",
+                        &format!(
+                            "pid={} start={} uid={:?}",
+                            identity.pid, identity.start_ticks, identity.uid
+                        ),
+                    )?;
+                }
+                Event::Disappeared { identity } => {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "process.disappeared",
+                        &format!("pid={} start={}", identity.pid, identity.start_ticks),
+                    )?;
+                    self.supervisor.transition(
+                        identity,
+                        State::Exited,
+                        now,
+                        "event:disappeared",
+                        "lifecycle",
+                        "process no longer visible",
+                    );
+                    st.transitions += 1;
+                    self.supervisor.retire(identity.pid);
+                }
+                Event::IdentityChanged { old, new } => {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "identity.changed",
+                        &format!(
+                            "pid={} old_start={} new_start={}",
+                            new.pid, old.start_ticks, new.start_ticks
+                        ),
+                    )?;
+                }
+                Event::OwnerExited { child, owner_pid } => {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Debug,
+                        "owner.exited",
+                        &format!("pid={} owner={}", child.pid, owner_pid),
+                    )?;
+                }
+                Event::StateChanged { identity, from, to } => {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Debug,
+                        "proc.state",
+                        &format!("pid={} {from}->{to}", identity.pid),
+                    )?;
+                }
+                Event::ScanDegraded {
+                    skipped_stat,
+                    skipped_mismatch,
+                } => {
+                    st.errors += 1;
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Warn,
+                        "scan.degraded",
+                        &format!("skipped_stat={skipped_stat} skipped_mismatch={skipped_mismatch}"),
+                    )?;
+                }
+            }
+        }
+
+        for p in &outcome.processes {
+            let id = identity::identify(p, self.boot_id.clone());
+            // Recycled PID under a live tracking key: prior state is void.
+            if let Some(stored) = self.supervisor.identity_of(p.pid) {
+                if !identity::verify(&stored, p) {
+                    let t = self.supervisor.transition(
+                        &id,
+                        State::Discovered,
+                        now,
+                        "identity:recycled-pid",
+                        "safety",
+                        "pid reused with new start_ticks/uid; prior state discarded",
+                    );
+                    st.transitions += 1;
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "identity.recycled",
+                        &format!(
+                            "pid={} start={} {}->{} at={} evidence={}",
+                            t.pid,
+                            t.start_ticks,
+                            t.from.as_str(),
+                            t.to.as_str(),
+                            t.at_unix,
+                            t.evidence
+                        ),
+                    )?;
+                }
+            }
+            // Terminal states persist without re-evaluation in Phase 2: no
+            // evidence source can advance them here, and disappearance is
+            // handled through events above. (Phase 3 re-opens them on change.)
+            if self
+                .supervisor
+                .state_of(p.pid)
+                .is_some_and(|s| s.terminal())
+            {
+                continue;
+            }
+            let prot = protect(p, self_pid, &rel, uid);
+            let adapter = adapter_for(&p.name, &p.command);
+            let signals = Signals {
+                owner_reports_active: liveness_to_signal(adapter.liveness(&id)),
+                proven_abandoned: false, // Phase 2: no evidence source can prove abandonment yet.
+                needs_tolerance: false,
+                memory_pressure: false,
+            };
+            let decision = policy::decide(&self.policy, &prot, p, &signals);
+            let current = self.supervisor.state_of(p.pid);
+            // Rescue during grace: owner evidence flipped back while we hold a
+            // deadline — cancel explicitly and say so.
+            if current == Some(State::GracePeriod)
+                && !matches!(decision, Decision::GraceCandidate { .. })
+            {
+                let t = self.supervisor.transition(
+                    &id,
+                    State::Observing,
+                    now,
+                    "owner:rescue-during-grace",
+                    "policy-10",
+                    "client reappeared during grace; close cancelled",
+                );
+                st.transitions += 1;
+                st.log_bytes += logx::log(
+                    &self.log_cfg,
+                    logx::Level::Info,
+                    "grace.cancelled",
+                    &format!(
+                        "pid={} {}->{} {}",
+                        t.pid,
+                        t.from.as_str(),
+                        t.to.as_str(),
+                        t.reason
+                    ),
+                )?;
+                continue;
+            }
+            let mut next = decide_state(&decision, current);
+            // Grace expiry without new evidence: record readiness, do nothing.
+            if current == Some(State::GracePeriod)
+                && matches!(next, State::GracePeriod)
+                && self.supervisor.grace_expired(p.pid, now)
+            {
+                next = State::ReadyForRevalidation;
+            }
+            // Fresh sightings start at Discovered (terminal states were skipped
+            // above and disappearance is handled through events).
+            let from = current.unwrap_or(State::Discovered);
+            if next != from {
+                if matches!(next, State::GracePeriod) {
+                    let grace = match &decision {
+                        Decision::GraceCandidate { grace_secs, .. } => *grace_secs,
+                        _ => self.policy.grace_known_secs,
+                    };
+                    self.supervisor.arm_grace(p.pid, now + grace);
+                }
+                let t = self.supervisor.transition(
+                    &id,
+                    next,
+                    now,
+                    "scan+policy",
+                    "policy-engine",
+                    &format!("{decision:?}"),
+                );
+                st.transitions += 1;
+                st.log_bytes += logx::log(
+                    &self.log_cfg,
+                    logx::Level::Info,
+                    "state.transition",
+                    &format!(
+                        "pid={} start={} {}->{} at={} evidence={} policy={} reason={}",
+                        t.pid,
+                        t.start_ticks,
+                        t.from.as_str(),
+                        t.to.as_str(),
+                        t.at_unix,
+                        t.evidence,
+                        t.policy,
+                        t.reason
+                    ),
+                )?;
+            } else if matches!(next, State::GracePeriod) && current.is_none() {
+                self.supervisor
+                    .arm_grace(p.pid, now + self.policy.grace_known_secs);
+            }
+        }
+
+        if let Err(e) = self.supervisor.persist() {
+            st.errors += 1;
+            st.log_bytes += logx::log(
+                &self.log_cfg,
+                logx::Level::Error,
+                "state.persist_failed",
+                &format!("error={e}"),
+            )?;
+        }
+        let usage = stats::self_usage();
+        st.log_bytes += logx::log(
+            &self.log_cfg,
+            logx::Level::Info,
+            "cycle.summary",
+            &st.summary(&usage),
+        )?;
+        Ok(st)
+    }
+}
+
+fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
+    let log_cfg = logx::LogConfig::new(state_dir.join("logs"));
+    let boot_id = identity::read_boot_id();
+    let state_file = state_dir.join("supervisor.json");
+    let mut supervisor = Supervisor::new(state_file.clone());
+    // Recover previous run without trusting old PIDs or timers.
+    let outcome = procfs::scan();
+    let live: HashMap<u32, (u64, Option<u32>)> = outcome
+        .processes
+        .iter()
+        .map(|p| (p.pid, (p.start_ticks, p.uid)))
+        .collect();
+    let (kept, discarded) = supervisor.reload(&live, logx::now_secs(), 300, &state_file);
+    let usage_start = stats::self_usage();
+    logx::log(&log_cfg, logx::Level::Info, "observer.started",
+        &format!("read_only=true recovered={kept} discarded_recycled={discarded} pidfd={} interval={interval}",
+            identity::pidfd_status()))?;
+    logx::enforce_retention(&log_cfg, &{
+        let (y, m, d) = logx::civil_date((logx::now_secs() / 86400) as i64);
+        format!("{y:04}-{m:02}-{d:02}")
+    });
+    println!(
+        "Reaper observer phase-2: read-only, interval={interval}s, logs={}",
+        state_dir.display()
+    );
+    println!("No signals will ever be sent by this build.");
+    let mut obs = Observer {
+        tracker: Tracker::new(boot_id),
+        supervisor,
+        policy: Policy::default(),
+        log_cfg,
+        boot_id: identity::read_boot_id(),
+        usage_start,
+    };
+    loop {
+        match obs.cycle() {
+            Ok(st) => {
+                let u = stats::self_usage();
+                println!("{} {}", logx::now_secs(), st.summary(&u));
+                let _ = &obs.usage_start;
+            }
+            Err(e) => eprintln!("cycle error (continuing): {e}"),
+        }
         thread::sleep(Duration::from_secs(interval));
     }
 }
+
 fn main() {
-    let args:Vec<String>=env::args().collect();
-    let state_dir=default_state_dir();
-    let result=match args.get(1).map(String::as_str) {
-        Some("scan")=>{let procs=scan();render(&procs);println!("Observed {} processes. READ ONLY.",procs.len());Ok(())},
-        Some("inspect")=>{match args.get(2).and_then(|s|s.parse::<u32>().ok()) { Some(pid)=> { let p=scan().into_iter().find(|p|p.pid==pid); if let Some(p)=p {println!("pid={} ppid={} start_ticks={} state={} uid={:?} rss_kib={} swap_kib={} class={} name={} executable={}",p.pid,p.ppid,p.start_ticks,p.state,p.uid,p.rss_kib,p.swap_kib,classify(&p,std::process::id()).as_str(),p.name,p.command); } else {eprintln!("PID not visible");} Ok(())},None=>Err(io::Error::new(io::ErrorKind::InvalidInput,"Expected PID"))}},
-        Some("observe")=>{let seconds=args.get(2).and_then(|s|s.parse::<u64>().ok()).unwrap_or(30).max(5); println!("Reaper observer: read-only, interval={}s; logs={}",seconds,state_dir.display());observe(seconds,&state_dir)},
-        _=>{println!("Reaper v0.1.0 (safe observation only)\nUsage: reaper scan | inspect <PID> | observe [interval_seconds]\nNever sends signals; no process termination in this build.");Ok(())}
+    let args: Vec<String> = env::args().collect();
+    let state_dir = logx::default_state_dir();
+    let result = match args.get(1).map(String::as_str) {
+        Some("scan") => cmd_scan(),
+        Some("inspect") => match args.get(2).and_then(|s| s.parse::<u32>().ok()) {
+            Some(pid) => cmd_inspect(pid),
+            None => Err(io::Error::new(io::ErrorKind::InvalidInput, "Expected PID")),
+        },
+        Some("observe") => {
+            let seconds = args
+                .get(2)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30)
+                .max(5);
+            cmd_observe(seconds, &PathBuf::from(&state_dir))
+        }
+        _ => {
+            println!("Reaper v0.2.0-phase2 (observable supervisor, still read-only)");
+            println!("Usage: reaper scan | inspect <PID> | observe [interval_seconds]");
+            println!("Never sends signals; READY_FOR_REVALIDATION performs no action.");
+            Ok(())
+        }
     };
-    if let Err(e)=result {eprintln!("reaper error: {}",e);std::process::exit(1)}
-}
-#[cfg(test)] mod tests {
-    use super::*;
-    #[test] fn parse_with_complex_comm(){let s=format!("123 (foo bar) baz) S 1 {}", vec!["0";18].join(" ")); assert_eq!(parse_stat(&s).unwrap().1,"foo bar) baz");}
-    #[test] fn never_auto_classify_unknown_as_safe(){let p=Process{pid:123,ppid:1,start_ticks:1,state:'S',name:"mystery".into(),command:"mystery".into(),rss_kib:0,swap_kib:0,uid:None};assert_eq!(classify(&p,999),Class::Unknown);}
-    #[test] fn critical_supervisor(){let p=Process{pid:123,ppid:1,start_ticks:1,state:'S',name:"runsvdir".into(),command:"runsvdir".into(),rss_kib:0,swap_kib:0,uid:None};assert_eq!(classify(&p,999),Class::Critical);}
-    #[test] fn json_escaping(){assert_eq!(quote_json("a\"\n"),"\"a\\\"\\n\"");}
-    #[test] fn utc_epoch(){assert_eq!(civil_date(0),(1970,1,1));}
+    if let Err(e) = result {
+        eprintln!("reaper error: {e}");
+        std::process::exit(1);
+    }
 }
