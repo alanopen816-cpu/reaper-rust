@@ -15,9 +15,11 @@ mod lab;
 mod logx;
 mod owner;
 mod pidfd;
+mod pilot;
 mod policy;
 mod procfs;
 mod protection;
+mod queries;
 mod relations;
 mod state;
 mod stats;
@@ -49,9 +51,32 @@ fn own_uid() -> Option<u32> {
 fn adapter_for(name: &str, exe: &str) -> Box<dyn OwnerAdapter> {
     let n = name.to_ascii_lowercase();
     if n == "runsvdir" || n == "runsv" || n == "svlogd" {
-        return Box::new(RunitService {
-            service_name: name.to_owned(),
-        });
+        // Process names alone do not identify a runit service. Resolve claims first;
+        // absent a pid+start match, fall through to an honest generic adapter.
+        let claims = owner::claims_map(&owner::default_svdir());
+        if let owner::OwnerVerdict::ClaimedActive { service }
+        | owner::OwnerVerdict::ClaimedDown { service } = owner::resolve(
+            &claims,
+            &procfs::Process {
+                pid: 0,
+                ppid: 0,
+                pgrp: 0,
+                session: 0,
+                start_ticks: 0,
+                state: 'S',
+                name: name.to_owned(),
+                command: exe.to_owned(),
+                rss_kib: 0,
+                swap_kib: 0,
+                uid: None,
+            },
+        ) {
+            return Box::new(RunitService {
+                service_name: service,
+                svdir: owner::default_svdir(),
+            });
+        }
+        return Box::new(GenericLinux);
     }
     if n.contains("opencode") || exe.contains("/opencode") {
         let _mode = OpenCode::classify(exe);
@@ -62,7 +87,9 @@ fn adapter_for(name: &str, exe: &str) -> Box<dyn OwnerAdapter> {
         return Box::new(Codex);
     }
     if exe.contains("/mcp") || n.contains("mcp") {
-        return Box::new(McpBroker);
+        return Box::new(McpBroker {
+            endpoint: "127.0.0.1:8377".into(),
+        });
     }
     Box::new(GenericLinux)
 }
@@ -161,6 +188,20 @@ fn cmd_inspect(pid: u32) -> io::Result<()> {
         "name={} executable={} rss_kib={} swap_kib={}",
         p.name, p.command, p.rss_kib, p.swap_kib
     );
+    let verified = vec![
+        format!("argv0 observed: {}", p.command),
+        format!(
+            "supervise claim for pid={} start_ticks={}: {:?}",
+            p.pid,
+            p.start_ticks,
+            owner::resolve(&owner::claims_map(&owner::default_svdir()), p)
+        ),
+    ];
+    let inferred = vec![format!(
+        "adapter category (not service identity): {}",
+        adapter.name()
+    )];
+    println!("identification verified={verified:?} inferred={inferred:?}");
     println!("protection={:?} reason={}", prot.tier, prot.reason);
     println!(
         "owner_adapter={} liveness={:?} shutdown={:?}",
@@ -217,7 +258,7 @@ struct Observer {
 
 impl Observer {
     fn cycle(&mut self) -> io::Result<stats::CycleStats> {
-        let mut st = stats::CycleStats::new();
+        let mut st = stats::CycleStats::new(&self.log_cfg.dir);
         let outcome = procfs::scan();
         st.inspected = outcome.processes.len();
         st.skipped = outcome.skipped_stat + outcome.skipped_mismatch;
@@ -380,6 +421,14 @@ impl Observer {
                 owner: owner_evidence,
                 grace_expired: false,
                 revalidated_now: false,
+                owner_dead: match owner_active {
+                    Some(false) => Some(true),
+                    Some(true) => Some(false),
+                    None => None,
+                },
+                // OpenCode and Codex expose no official client/work-list API here.
+                last_client_gone: None,
+                no_pending_work: None,
             };
             let _absence = evidence::positive_vs_absent(&ev);
             let signals = Signals {
@@ -518,6 +567,9 @@ fn cmd_close(pid: u32, act: bool) -> io::Result<()> {
         owner: owner::OwnerVerdict::Unclaimed,
         grace_expired: logx::now_secs() >= entry.spawned_at.saturating_add(300),
         revalidated_now: true,
+        owner_dead: None,
+        last_client_gone: None,
+        no_pending_work: None,
     };
     if !evidence::proven(&evidence) {
         println!("close receipt: refused; evidence={evidence:?} proven=false; no signal");
@@ -651,6 +703,26 @@ fn main() {
             }
         }
         Some("scan") => cmd_scan(),
+        Some("pilot") => match args.get(2).map(String::as_str) {
+            Some("report") => pilot::report(),
+            Some("metrics") => pilot::metrics(&PathBuf::from(&state_dir)),
+            Some("start") => {
+                let interval = args
+                    .iter()
+                    .position(|a| a == "--interval")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(30)
+                    .max(5);
+                pilot::start(&PathBuf::from(&state_dir), interval)
+            }
+            Some("status") => pilot::status(&PathBuf::from(&state_dir)),
+            Some("stop") => pilot::stop(&PathBuf::from(&state_dir)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Usage: pilot report|metrics|start|status|stop",
+            )),
+        },
         Some("inspect") => match args.get(2).and_then(|s| s.parse::<u32>().ok()) {
             Some(pid) => cmd_inspect(pid),
             None => Err(io::Error::new(io::ErrorKind::InvalidInput, "Expected PID")),
@@ -666,6 +738,7 @@ fn main() {
         _ => {
             println!("Reaper v0.2.0-phase2 (observable supervisor, still read-only)");
             println!("Usage: reaper scan | inspect <PID> | observe [interval_seconds]");
+            println!("       reaper pilot report|metrics|start|status|stop");
             println!("Signals are possible only via close --act for registry-verified lab PIDs.");
             Ok(())
         }
@@ -673,5 +746,16 @@ fn main() {
     if let Err(e) = result {
         eprintln!("reaper error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod pilot_gap_tests {
+    use super::*;
+
+    #[test]
+    fn runit_process_name_without_identity_claim_is_not_a_service() {
+        let adapter = adapter_for("runsv", "/usr/bin/runsv");
+        assert_eq!(adapter.name(), "generic-linux");
     }
 }
