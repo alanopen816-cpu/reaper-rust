@@ -314,13 +314,13 @@ mod tests {
 
     #[test]
     fn supervisor_restart_discards_recycled_pids_and_rearms_grace() {
-        let dir = std::env::temp_dir().join("reaper-restart-test");
-        let _ = fs::remove_dir_all(&dir);
+        let dir = std::env::temp_dir().join(format!("reaper-restart-test-{}", std::process::id()));
         let file = dir.join("state.json");
         let mut s = Supervisor::new(file.clone());
         s.transition(&id(10, 100), State::GracePeriod, 1000, "e", "p", "r");
         s.arm_grace(10, 1000 + 600);
-        s.transition(&id(11, 110), State::Observing, 1000, "e", "p", "r");
+        s.transition(&id(11, 110), State::GracePeriod, 1000, "e", "p", "r");
+        s.arm_grace(11, 1000 + 600);
         s.persist().unwrap();
         // PID 10 recycled (new start), PID 11 identical.
         let live: HashMap<u32, (u64, Option<u32>)> =
@@ -330,8 +330,11 @@ mod tests {
         let mut s2 = Supervisor::new(file.clone());
         let (kept, discarded) = s2.reload(&live, 5000, 600, &file);
         assert_eq!((kept, discarded), (1, 1));
-        assert_eq!(s2.state_of(11), Some(State::Observing));
+        assert_eq!(s2.state_of(11), Some(State::GracePeriod));
         assert_eq!(s2.state_of(10), None);
+        assert!(!s2.grace_expired(10, 5600));
+        assert!(!s2.grace_expired(11, 5599));
+        assert!(s2.grace_expired(11, 5600));
         let _ = fs::remove_dir_all(&dir);
     }
 }

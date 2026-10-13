@@ -33,6 +33,10 @@ impl Drop for LabChild {
 }
 
 fn registry_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_REGISTRY_PATH.with(|path| path.borrow().clone()) {
+        return path;
+    }
     if let Some(path) = std::env::var_os("REAPER_LAB_REGISTRY") {
         return PathBuf::from(path);
     }
@@ -151,6 +155,7 @@ pub fn registry_path_current() -> PathBuf {
     registry_path()
 }
 fn register(entry: &Entry) -> io::Result<()> {
+    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = registry_path();
     let mut entries = read_registry_at(&path)?;
     entries.retain(|e| e.pid != entry.pid);
@@ -205,6 +210,7 @@ pub fn cleanup_with(allow_sigkill: bool) -> io::Result<usize> {
         eprintln!("lab cleanup refused: explicit act authorization required; registry unchanged");
         return Ok(0);
     }
+    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = registry_path();
     if !path.exists() {
         return Ok(0);
@@ -260,9 +266,22 @@ pub fn cleanup_with(allow_sigkill: bool) -> io::Result<usize> {
 #[cfg(test)]
 pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static TEST_REGISTRY_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn with_registry_path<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
+        TEST_REGISTRY_PATH.with(|slot| *slot.borrow_mut() = Some(path));
+        let result = f();
+        TEST_REGISTRY_PATH.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
     #[derive(Default)]
     struct FakeExecutor {
         calls: Vec<crate::terminate::SignalKind>,
@@ -467,5 +486,67 @@ mod tests {
             std::env::temp_dir().join(format!("reaper-lab-{}-e.json", std::process::id())),
         );
         assert_eq!(cleanup().expect("default cleanup refusal"), 0);
+    }
+
+    #[test]
+    fn isolated_registries_spawn_verify_and_cleanup_concurrently() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("reaper-lab-isolated-{}", std::process::id()));
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let path = root.join(format!("registry-{index}.json"));
+                std::thread::spawn(move || {
+                    with_registry_path(path.clone(), || {
+                        let child = spawn(false).expect("spawn isolated lab child");
+                        let entry = child.entry.clone();
+                        assert!(registry_contains(&entry).expect("verify isolated entry"));
+                        assert_eq!(read_registry_at(&path).unwrap(), vec![entry]);
+                        drop(child);
+                        write_registry(&[], &path).expect("clear isolated test registry");
+                        assert!(read_registry_at(&path).unwrap().is_empty());
+                    })
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("isolated registry worker");
+        }
+    }
+
+    #[test]
+    fn shared_registry_concurrent_registration_loses_no_entries() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path =
+            std::env::temp_dir().join(format!("reaper-lab-shared-{}.json", std::process::id()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    with_registry_path(path, || {
+                        let child = spawn(false).expect("spawn shared-registry lab child");
+                        let entry = child.entry.clone();
+                        assert!(registry_contains(&entry).expect("verify shared entry"));
+                        barrier.wait();
+                        child
+                    })
+                })
+            })
+            .collect();
+        barrier.wait();
+        let children: Vec<_> = threads
+            .into_iter()
+            .map(|t| t.join().expect("shared worker"))
+            .collect();
+        let entries = read_registry_at(&path).expect("read shared registry");
+        assert_eq!(entries.len(), 8, "registry entries: {entries:?}");
+        let pids: std::collections::HashSet<_> = entries.iter().map(|entry| entry.pid).collect();
+        assert_eq!(pids.len(), 8, "duplicate registry entries: {entries:?}");
+        drop(children);
+        with_registry_path(path.clone(), || {
+            write_registry(&[], &path).expect("clear shared test registry");
+        });
+        assert!(read_registry_at(&path).unwrap().is_empty());
     }
 }

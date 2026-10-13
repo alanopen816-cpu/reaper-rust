@@ -11,6 +11,8 @@
 //! responsibility (`~/mcp-broker-lab` is not modified and not duplicated).
 
 use crate::identity::ProcessIdentity;
+use crate::queries::{broker_health, sv_status, SvState};
+use std::path::PathBuf;
 
 /// Owner liveness from the owner's own point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,7 @@ impl OwnerAdapter for GenericLinux {
 /// Phase 2 reports Unknown until that read is wired, never assumes.
 pub struct RunitService {
     pub service_name: String,
+    pub svdir: PathBuf,
 }
 impl OwnerAdapter for RunitService {
     fn name(&self) -> &'static str {
@@ -77,8 +80,34 @@ impl OwnerAdapter for RunitService {
     fn detail(&self) -> String {
         format!("runit:{}", self.service_name)
     }
-    fn liveness(&self, _id: &ProcessIdentity) -> Liveness {
-        Liveness::Unknown
+    fn liveness(&self, id: &ProcessIdentity) -> Liveness {
+        let claims = crate::owner::claims_map(&self.svdir);
+        let claim = crate::owner::resolve(
+            &claims,
+            &crate::procfs::Process {
+                pid: id.pid,
+                ppid: 0,
+                pgrp: 0,
+                session: 0,
+                start_ticks: id.start_ticks,
+                state: 'S',
+                name: String::new(),
+                command: String::new(),
+                rss_kib: 0,
+                swap_kib: 0,
+                uid: id.uid,
+            },
+        );
+        let status = sv_status(&self.service_name);
+        match (claim, status) {
+            (crate::owner::OwnerVerdict::ClaimedActive { .. }, SvState::Up { .. }) => {
+                Liveness::Alive
+            }
+            (crate::owner::OwnerVerdict::ClaimedDown { .. }, SvState::Down | SvState::Finish) => {
+                Liveness::Dead
+            }
+            _ => Liveness::Unknown,
+        }
     }
     fn request_official_shutdown(&self, id: &ProcessIdentity) -> Shutdown {
         declined(id, "sv down")
@@ -88,13 +117,19 @@ impl OwnerAdapter for RunitService {
 /// External MCP broker backends: liveness belongs to the broker's /health.
 /// Reaper calls the broker interface when wired; it never re-implements the
 /// broker's grace/SIGTERM→SIGKILL sequence.
-pub struct McpBroker;
+pub struct McpBroker {
+    pub endpoint: String,
+}
 impl OwnerAdapter for McpBroker {
     fn name(&self) -> &'static str {
         "mcp-broker"
     }
     fn liveness(&self, _id: &ProcessIdentity) -> Liveness {
-        Liveness::Unknown
+        match broker_health(&self.endpoint).alive {
+            Some(true) => Liveness::Alive,
+            Some(false) => Liveness::Dead,
+            None => Liveness::Unknown,
+        }
     }
     fn request_official_shutdown(&self, id: &ProcessIdentity) -> Shutdown {
         declined(id, "broker")
@@ -124,6 +159,9 @@ impl OwnerAdapter for OpenCode {
     fn liveness(&self, _id: &ProcessIdentity) -> Liveness {
         Liveness::Unknown
     }
+    fn detail(&self) -> String {
+        "opencode (Unknown: official client-list interface unavailable)".into()
+    }
     fn request_official_shutdown(&self, id: &ProcessIdentity) -> Shutdown {
         Shutdown::Prepared {
             command: format!(
@@ -147,6 +185,9 @@ impl OwnerAdapter for Codex {
     }
     fn liveness(&self, _id: &ProcessIdentity) -> Liveness {
         Liveness::Unknown
+    }
+    fn detail(&self) -> String {
+        "codex (Unknown: official work-queue interface unavailable)".into()
     }
     fn request_official_shutdown(&self, id: &ProcessIdentity) -> Shutdown {
         Shutdown::Prepared {
@@ -175,8 +216,11 @@ mod tests {
             Box::new(GenericLinux),
             Box::new(RunitService {
                 service_name: "x".into(),
+                svdir: PathBuf::from("/nonexistent"),
             }),
-            Box::new(McpBroker),
+            Box::new(McpBroker {
+                endpoint: "127.0.0.1:1".into(),
+            }),
             Box::new(OpenCode),
             Box::new(Codex),
         ];
@@ -200,5 +244,7 @@ mod tests {
         assert!(!Codex::classify("codex exec"));
         assert_eq!(OpenCode.liveness(&id()), Liveness::Unknown);
         assert_eq!(Codex.liveness(&id()), Liveness::Unknown);
+        assert!(OpenCode.detail().contains("client-list"));
+        assert!(Codex.detail().contains("work-queue"));
     }
 }

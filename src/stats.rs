@@ -51,10 +51,13 @@ pub struct CycleStats {
     pub transitions: usize,
     pub log_bytes: usize,
     pub errors: usize,
+    pub swap_total_kib: u64,
+    pub swap_free_kib: u64,
+    pub log_dir_bytes: u64,
 }
 
 impl CycleStats {
-    pub fn new() -> Self {
+    pub fn new(log_dir: &std::path::Path) -> Self {
         CycleStats {
             started: Instant::now(),
             inspected: 0,
@@ -63,6 +66,9 @@ impl CycleStats {
             transitions: 0,
             log_bytes: 0,
             errors: 0,
+            swap_total_kib: crate::queries::meminfo_swap().0,
+            swap_free_kib: crate::queries::meminfo_swap().1,
+            log_dir_bytes: crate::queries::dir_size_bytes(log_dir),
         }
     }
 
@@ -72,7 +78,7 @@ impl CycleStats {
 
     pub fn summary(&self, usage: &SelfUsage) -> String {
         format!(
-            "cycle_ms={} inspected={} skipped={} events={} transitions={} errors={} log_bytes={} self_rss_kib={} self_cpu_ticks={}",
+            "cycle_ms={} inspected={} skipped={} events={} transitions={} errors={} log_bytes={} self_rss_kib={} self_cpu_ticks={} swap_total_kib={} swap_free_kib={} log_dir_bytes={}",
             self.elapsed_ms(),
             self.inspected,
             self.skipped,
@@ -81,7 +87,10 @@ impl CycleStats {
             self.errors,
             self.log_bytes,
             usage.rss_kib,
-            usage.cpu_ticks
+            usage.cpu_ticks,
+            self.swap_total_kib,
+            self.swap_free_kib,
+            self.log_dir_bytes
         )
     }
 }
@@ -94,5 +103,14 @@ mod tests {
     fn self_measurement_is_real() {
         let u = self_usage();
         assert!(u.rss_kib > 0, "own RSS must be observable");
+    }
+
+    #[test]
+    fn cycle_metric_uses_configured_log_directory() {
+        let dir = std::env::temp_dir().join(format!("reaper-metric-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("one.log"), b"12345").unwrap();
+        assert_eq!(CycleStats::new(&dir).log_dir_bytes, 5);
+        let _ = fs::remove_dir_all(dir);
     }
 }
