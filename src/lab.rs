@@ -126,13 +126,16 @@ pub fn read_registry_at(path: &std::path::Path) -> io::Result<Vec<Entry>> {
     Ok(entries)
 }
 fn write_registry(entries: &[Entry], path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     fs::create_dir_all(path.parent().unwrap())?;
     let tmp = path.with_extension("json.tmp");
     let mut f = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
+        .mode(0o600)
         .open(&tmp)?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
     write!(f, "[")?;
     for (i, e) in entries.iter().enumerate() {
         if i != 0 {
@@ -146,7 +149,8 @@ fn write_registry(entries: &[Entry], path: &std::path::Path) -> io::Result<()> {
     }
     writeln!(f, "]")?;
     f.sync_all()?;
-    fs::rename(tmp, path)
+    fs::rename(tmp, path)?;
+    fs::File::open(path.parent().unwrap())?.sync_all()
 }
 pub fn registry_contains(entry: &Entry) -> io::Result<bool> {
     Ok(read_registry_at(&registry_path())?
@@ -217,6 +221,7 @@ pub fn persist_close_receipt(entry: &Entry, stages: &[String], verdict: &str) ->
         ));
     }
     file.sync_all()?;
+    fs::File::open(path.parent().unwrap())?.sync_all()?;
     eprintln!("lab close receipt pid={} verdict={verdict}", entry.pid);
     Ok(())
 }
@@ -298,7 +303,7 @@ pub fn cleanup_with(allow_sigkill: bool) -> io::Result<usize> {
                 term_wait_secs: 1,
                 allow_sigkill,
             },
-            true,
+            None,
             &mut signaller,
             |pid, ticks, spawned| {
                 registry_contains(&Entry {
@@ -348,6 +353,45 @@ mod tests {
         TEST_REGISTRY_PATH.with(|slot| *slot.borrow_mut() = None);
         result
     }
+    #[test]
+    fn receipts_and_replaced_registry_reopen_as_a_consistent_durable_pair() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("reaper-receipt-pair-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = root.join("lab.json");
+        with_registry_path(registry.clone(), || {
+            let first_child = spawn(false).expect("first registered lab child");
+            let first_state = std::fs::read(&registry).unwrap();
+            let child = spawn(false).expect("second registered lab child replaces registry");
+            let entry = child.entry.clone();
+            assert_eq!(
+                std::fs::metadata(&registry).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            persist_close_receipt(&entry, &["stage-one".into()], "in_progress").unwrap();
+            persist_close_receipt(&entry, &["stage-two".into()], "closed").unwrap();
+            let reopened_state = read_registry_at(&registry).unwrap();
+            let receipt_text = std::fs::read_to_string(receipt_path_current()).unwrap();
+            assert!(reopened_state.contains(&entry));
+            assert!(receipt_text.contains("stage-one") && receipt_text.contains("stage-two"));
+            assert!(receipt_text
+                .lines()
+                .all(|line| line.contains(&format!("\"pid\":{}", entry.pid))
+                    && line.contains(&format!("\"start_ticks\":{}", entry.start_ticks))));
+
+            // A refusal before attempting the next atomic registry replacement
+            // leaves the last valid state/receipt pair intact; no crash is induced.
+            persist_close_receipt(&entry, &["replacement-refused".into()], "refused").unwrap();
+            assert_eq!(read_registry_at(&registry).unwrap(), reopened_state);
+            assert!(std::fs::read_to_string(receipt_path_current())
+                .unwrap()
+                .contains("replacement-refused"));
+            assert_ne!(first_state, std::fs::read(&registry).unwrap());
+            drop(child);
+            drop(first_child);
+        });
+    }
     #[derive(Default)]
     struct FakeExecutor {
         calls: Vec<crate::terminate::SignalKind>,
@@ -357,6 +401,7 @@ mod tests {
             &mut self,
             _: &crate::terminate::LabRecord,
             signal: crate::terminate::SignalKind,
+            _: &crate::terminate::FreshApproval,
         ) -> Result<crate::terminate::SignalReceipt, crate::terminate::Refusal> {
             self.calls.push(signal);
             Ok(crate::terminate::SignalReceipt {
@@ -364,6 +409,38 @@ mod tests {
                 signal,
             })
         }
+    }
+    fn live_test_approval(pid: u32, ticks: u64) -> crate::terminate::FreshApproval {
+        let process = crate::procfs::scan()
+            .processes
+            .into_iter()
+            .find(|p| p.pid == pid && p.start_ticks == ticks)
+            .expect("live test child");
+        crate::terminate::approve_fresh(crate::terminate::FreshApprovalInputs {
+            evidence: crate::evidence::AbandonEvidence {
+                lab_member: true,
+                owner: crate::owner::OwnerVerdict::Unclaimed,
+                grace_expired: true,
+                revalidated_now: true,
+                owner_dead: Some(true),
+                last_client_gone: Some(true),
+                no_pending_work: Some(true),
+            },
+            process,
+            protection: crate::protection::Protection {
+                tier: crate::protection::Tier::Known,
+                reason: "test lab child".into(),
+            },
+            policy: crate::policy::Policy::default(),
+            signals: crate::policy::Signals {
+                owner_reports_active: Some(false),
+                proven_abandoned: true,
+                needs_tolerance: false,
+                memory_pressure: false,
+                client_coverage: crate::client_tracker::Coverage::CompleteVerified,
+            },
+        })
+        .expect("test-owned evidence approves child")
     }
     #[test]
     fn spawn_verify_registry_cleanup_and_drop() {
@@ -411,7 +488,7 @@ mod tests {
                 term_wait_secs: 1,
                 allow_sigkill: true,
             },
-            true,
+            Some(&live_test_approval(entry.pid, entry.start_ticks)),
             &mut signer,
             |pid, ticks, spawned| {
                 registry_contains(&Entry {
@@ -471,7 +548,7 @@ mod tests {
                 term_wait_secs: 1,
                 allow_sigkill: false,
             },
-            true,
+            Some(&live_test_approval(entry.pid, entry.start_ticks)),
             &mut crate::terminate::PidfdSignaller,
             |pid, ticks, spawned| {
                 registry_contains(&Entry {
@@ -529,7 +606,10 @@ mod tests {
                 term_wait_secs: 0,
                 allow_sigkill: true,
             },
-            true,
+            Some(&crate::terminate::test_approval(
+                entry.pid,
+                entry.start_ticks,
+            )),
             &mut executor,
             |pid, ticks, _| start_ticks(pid).ok() == Some(ticks),
             |_| {},

@@ -81,27 +81,32 @@ fn final_close_gate(
     entry: &crate::lab::Entry,
     inputs: &CloseInputs,
     grace_elapsed: bool,
-) -> io::Result<()> {
-    let refuse = |reason: String| -> io::Result<()> {
+) -> io::Result<crate::terminate::FreshApproval> {
+    let refuse = |reason: String| -> io::Error {
         eprintln!("lab close refused: {reason}");
-        crate::lab::persist_close_receipt(entry, &[format!("gate refused: {reason}")], &reason)?;
-        Err(io::Error::other(reason))
+        let _ =
+            crate::lab::persist_close_receipt(entry, &[format!("gate refused: {reason}")], &reason);
+        io::Error::other(reason)
     };
     if !grace_elapsed {
-        return refuse("grace has not elapsed".into());
+        return Err(refuse("grace has not elapsed".into()));
     }
     let registered = match crate::lab::registry_contains(entry) {
         Ok(registered) => registered,
-        Err(error) => return refuse(format!("lab registry revalidation unavailable: {error}")),
+        Err(error) => {
+            return Err(refuse(format!(
+                "lab registry revalidation unavailable: {error}"
+            )))
+        }
     };
     if !registered {
-        return refuse("target is not lab-registered".into());
+        return Err(refuse("target is not lab-registered".into()));
     }
     let identity_matches = inputs.process.pid == entry.pid
         && inputs.process.start_ticks == entry.start_ticks
         && crate::lab::identity_ticks(entry.pid).ok() == Some(entry.start_ticks);
     if !identity_matches {
-        return refuse("stable process identity revalidation failed".into());
+        return Err(refuse("stable process identity revalidation failed".into()));
     }
     let (last_client_gone, no_pending_work) =
         crate::evidence::client_work_to_fields(&inputs.client_work);
@@ -115,9 +120,9 @@ fn final_close_gate(
         no_pending_work,
     };
     if !crate::evidence::proven(&evidence) {
-        return refuse(format!(
+        return Err(refuse(format!(
             "fresh abandonment evidence is unproven: {evidence:?}"
-        ));
+        )));
     }
     let work_activity = match inputs.client_work {
         crate::evidence::ClientWorkState::Active { .. } => Some(true),
@@ -147,7 +152,7 @@ fn final_close_gate(
         == crate::client_tracker::Coverage::CompleteVerified
         && inputs.owner_active == Some(false);
     let work_signal = crate::client_tracker::combine_signals(inputs.owner_active, work_activity);
-    let (_, _, approval) = crate::classified_decision(
+    let (_, protection, decision) = crate::classified_decision(
         &inputs.process,
         &id,
         &inputs.relations,
@@ -159,10 +164,19 @@ fn final_close_gate(
         &signals,
         &[],
     );
-    if !matches!(approval, crate::policy::Decision::GraceCandidate { .. }) {
-        return refuse(format!("recomputed policy refused close: {approval:?}"));
+    if !matches!(decision, crate::policy::Decision::GraceCandidate { .. }) {
+        return Err(refuse(format!(
+            "recomputed policy refused close: {decision:?}"
+        )));
     }
-    Ok(())
+    crate::terminate::approve_fresh(crate::terminate::FreshApprovalInputs {
+        evidence,
+        process: inputs.process.clone(),
+        protection,
+        policy: crate::policy::Policy::default(),
+        signals,
+    })
+    .ok_or_else(|| io::Error::other("fresh policy approval could not bind process identity"))
 }
 
 fn interrupted_close_action(entry: &crate::lab::Entry) -> io::Result<Option<RestartAction>> {
@@ -194,7 +208,7 @@ pub fn close_ready_entry(entry: &crate::lab::Entry) -> io::Result<Vec<String>> {
             crate::lab::persist_close_receipt(entry, &["fresh_evidence:refused".into()], &reason);
         io::Error::other(reason)
     })?;
-    final_close_gate(entry, &inputs, true)?;
+    let approval = final_close_gate(entry, &inputs, true)?;
     crate::lab::persist_close_receipt(entry, &["close_initiated".into()], "in_progress")?;
     let record = LabRecord {
         pid: entry.pid,
@@ -209,7 +223,7 @@ pub fn close_ready_entry(entry: &crate::lab::Entry) -> io::Result<Vec<String>> {
             term_wait_secs: 1,
             allow_sigkill: false,
         },
-        true,
+        Some(&approval),
         &mut signaller,
         |pid, ticks, spawned| {
             crate::lab::registry_contains(&crate::lab::Entry {
@@ -354,7 +368,7 @@ where
             crate::lab::persist_close_receipt(entry, &["fresh_evidence:refused".into()], &reason);
         io::Error::other(reason)
     })?;
-    final_close_gate(entry, &fresh, true)?;
+    let approval = final_close_gate(entry, &fresh, true)?;
     eprintln!("lab close gate approved: proven evidence and recomputed policy");
     crate::lab::persist_close_receipt(entry, &["close_initiated".into()], "in_progress")?;
     let record = LabRecord {
@@ -369,7 +383,7 @@ where
             term_wait_secs: 1,
             allow_sigkill: false,
         },
-        true,
+        Some(&approval),
         &mut terminate::PidfdSignaller,
         |pid, ticks, spawned| {
             crate::lab::registry_contains(&crate::lab::Entry {

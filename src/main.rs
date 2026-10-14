@@ -899,7 +899,7 @@ fn cmd_close(pid: u32, act: bool) -> io::Result<()> {
         for receipt in terminate::close_sequence(
             &rec,
             &policy,
-            false,
+            None,
             &mut terminate::PidfdSignaller,
             |pid, ticks, spawned| {
                 lab::registry_contains(&lab::Entry {
@@ -921,11 +921,30 @@ fn cmd_close(pid: u32, act: bool) -> io::Result<()> {
         println!("close receipt: refused; PID is gone; no signal");
         return Ok(());
     };
+    let rel = relations::build(std::slice::from_ref(&p));
+    let base = protect(&p, std::process::id(), &rel, p.uid);
+    let approval = terminate::approve_fresh(terminate::FreshApprovalInputs {
+        evidence: evidence.clone(),
+        process: p.clone(),
+        protection: base,
+        policy: Policy::default(),
+        signals: Signals {
+            owner_reports_active: evidence.owner_dead.map(|dead| !dead),
+            proven_abandoned: evidence::proven(&evidence),
+            needs_tolerance: false,
+            memory_pressure: false,
+            client_coverage: client_tracker::Coverage::Unknown,
+        },
+    });
+    let Some(approval) = approval else {
+        println!("close receipt: refused; fresh policy approval unavailable; no signal");
+        return Ok(());
+    };
     let mut s = terminate::PidfdSignaller;
     for receipt in terminate::close_sequence(
         &rec,
         &policy,
-        true,
+        Some(&approval),
         &mut s,
         |pid, ticks, spawned| {
             lab::registry_contains(&lab::Entry {

@@ -1,6 +1,116 @@
 //! Auditable close planning. Signals are available only through the lab close
 //! sequence after registry membership and process identity are revalidated.
-use std::time::Duration;
+use std::{fs, time::Duration};
+
+#[derive(Debug, Clone)]
+pub struct FreshApprovalInputs {
+    pub evidence: crate::evidence::AbandonEvidence,
+    pub process: crate::procfs::Process,
+    pub protection: crate::protection::Protection,
+    pub policy: crate::policy::Policy,
+    pub signals: crate::policy::Signals,
+}
+
+#[derive(Debug)]
+pub struct FreshApproval {
+    pid: u32,
+    start_ticks: u64,
+    boot_id: String,
+    uid: u32,
+    executable: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessTuple {
+    pid: u32,
+    start_ticks: u64,
+    boot_id: String,
+    uid: u32,
+    executable: String,
+}
+
+fn read_process_tuple(pid: u32) -> std::io::Result<ProcessTuple> {
+    let base = format!("/proc/{pid}");
+    let status = fs::read_to_string(format!("{base}/status"))?;
+    let uid = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Uid:")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .ok_or_else(|| std::io::Error::other("UID unavailable in /proc status"))?;
+    let stat = fs::read_to_string(format!("{base}/stat"))?;
+    let close = stat
+        .rfind(')')
+        .ok_or_else(|| std::io::Error::other("malformed /proc stat"))?;
+    let start_ticks = stat[close + 1..]
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| std::io::Error::other("start ticks unavailable in /proc stat"))?
+        .parse()
+        .map_err(|_| std::io::Error::other("invalid start ticks in /proc stat"))?;
+    // Require cmdline readability too: it is part of the fresh observation and
+    // an inaccessible proc datum must never silently degrade identity checking.
+    let cmdline = fs::read(format!("{base}/cmdline"))?;
+    if cmdline.is_empty() {
+        return Err(std::io::Error::other("empty /proc cmdline"));
+    }
+    let executable = fs::read_link(format!("{base}/exe"))?
+        .to_string_lossy()
+        .into_owned();
+    if executable.is_empty() {
+        return Err(std::io::Error::other("empty /proc exe"));
+    }
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
+    if boot_id.is_empty() {
+        return Err(std::io::Error::other("empty boot ID"));
+    }
+    Ok(ProcessTuple {
+        pid,
+        start_ticks,
+        boot_id,
+        uid,
+        executable,
+    })
+}
+
+pub fn approve_fresh(inputs: FreshApprovalInputs) -> Option<FreshApproval> {
+    if !crate::evidence::proven(&inputs.evidence) {
+        return None;
+    }
+    let decision = crate::policy::decide(
+        &inputs.policy,
+        &inputs.protection,
+        &inputs.process,
+        &inputs.signals,
+    );
+    if !matches!(decision, crate::policy::Decision::GraceCandidate { .. }) {
+        return None;
+    }
+    let tuple = match read_process_tuple(inputs.process.pid) {
+        Ok(tuple) => tuple,
+        Err(error) => {
+            eprintln!("fresh approval refused: process identity unavailable: {error}");
+            return None;
+        }
+    };
+    if tuple.start_ticks != inputs.process.start_ticks || Some(tuple.uid) != inputs.process.uid {
+        eprintln!("fresh approval refused: process identity differs from supplied evidence");
+        return None;
+    }
+    Some(FreshApproval {
+        pid: tuple.pid,
+        start_ticks: tuple.start_ticks,
+        boot_id: tuple.boot_id,
+        uid: tuple.uid,
+        executable: tuple.executable,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosePolicy {
@@ -74,6 +184,7 @@ impl PidfdSignaller {
         &mut self,
         record: &LabRecord,
         signal: SignalKind,
+        expected: &FreshApproval,
     ) -> Result<SignalReceipt, Refusal> {
         let entry = crate::lab::Entry {
             pid: record.pid,
@@ -86,8 +197,10 @@ impl PidfdSignaller {
             return Err(Refusal::NotRegistered);
         }
         let sig = if signal == SignalKind::Term { 15 } else { 9 };
-        if let Ok(fd) = crate::pidfd::open(record.pid) {
-            if crate::lab::identity_ticks(record.pid).ok() != Some(record.start_ticks) {
+        let pidfd = crate::pidfd::open(record.pid).ok();
+        let selected_path = signal_path(pidfd.is_some());
+        if let Some(fd) = pidfd.filter(|_| selected_path == SignalPath::Pidfd) {
+            if !tuple_matches(record.pid, record.start_ticks, expected) {
                 let _ = crate::pidfd::close(fd);
                 return Err(Refusal::IdentityChanged);
             }
@@ -95,23 +208,52 @@ impl PidfdSignaller {
             let _ = crate::pidfd::close(fd);
             return result
                 .map(|_| SignalReceipt {
-                    path: SignalPath::Pidfd,
+                    path: selected_path,
                     signal,
                 })
                 .map_err(|e| Refusal::SignalFailed(e.to_string()));
         }
-        if crate::lab::identity_ticks(record.pid).ok() != Some(record.start_ticks) {
-            return Err(Refusal::IdentityChanged);
-        }
-        if crate::lab::identity_ticks(record.pid).ok() != Some(record.start_ticks) {
+        // Classic kill(pid) cannot atomically bind validation to delivery; PID
+        // reuse between this full-tuple check and kill(2) is inherent. Prefer
+        // pidfd whenever available, and fail closed if any tuple datum is absent.
+        if !tuple_matches(record.pid, record.start_ticks, expected) {
             return Err(Refusal::IdentityChanged);
         }
         unsafe { signal_classic(record.pid, sig) }
             .map(|_| SignalReceipt {
-                path: SignalPath::Classic,
+                path: selected_path,
                 signal,
             })
             .map_err(|e| Refusal::SignalFailed(e.to_string()))
+    }
+}
+
+fn tuple_matches(pid: u32, ticks: u64, expected: &FreshApproval) -> bool {
+    match read_process_tuple(pid) {
+        Ok(actual) => {
+            let matches = actual.pid == expected.pid
+                && actual.start_ticks == ticks
+                && actual.start_ticks == expected.start_ticks
+                && actual.boot_id == expected.boot_id
+                && actual.uid == expected.uid
+                && actual.executable == expected.executable;
+            if !matches {
+                eprintln!("signal refused: full process identity tuple changed (pid/start/boot/uid/executable)");
+            }
+            matches
+        }
+        Err(error) => {
+            eprintln!("signal refused: full process identity unavailable: {error}");
+            false
+        }
+    }
+}
+
+fn signal_path(pidfd_opened: bool) -> SignalPath {
+    if pidfd_opened {
+        SignalPath::Pidfd
+    } else {
+        SignalPath::Classic
     }
 }
 
@@ -120,7 +262,7 @@ impl PidfdSignaller {
 pub fn close_sequence<S, F, W, O>(
     record: &LabRecord,
     policy: &ClosePolicy,
-    act: bool,
+    approval: Option<&FreshApproval>,
     signaller: &mut S,
     mut verified: F,
     mut wait: W,
@@ -133,7 +275,7 @@ where
     O: FnMut() -> String,
 {
     let mut receipts = Vec::new();
-    if !act {
+    let Some(approval) = approval else {
         receipts.push("official-first: not invoked in dry-run".into());
         receipts.extend([
             "TERM: dry-run".into(),
@@ -146,6 +288,14 @@ where
             },
         ]);
         return receipts;
+    };
+    if approval.pid != record.pid || approval.start_ticks != record.start_ticks {
+        eprintln!(
+            "close refused: approval identity mismatch for target PID {}",
+            record.pid
+        );
+        receipts.push("close refused: approval identity mismatch".into());
+        return receipts;
     }
     receipts.push(format!("official-first: {}", official()));
     if !verified(record.pid, record.start_ticks, record.spawned_at) {
@@ -153,7 +303,7 @@ where
         return receipts;
     }
     receipts.push("revalidate before TERM: registry membership and identity match".into());
-    match signaller.signal_record(record, SignalKind::Term) {
+    match signaller.signal_record(record, SignalKind::Term, approval) {
         Ok(r) => receipts.push(format!("TERM: {r:?}")),
         Err(e) => {
             receipts.push(format!("TERM refused: {e:?}"));
@@ -171,7 +321,7 @@ where
         receipts.push("KILL refused: not authorized".into());
         return receipts;
     }
-    match signaller.signal_record(record, SignalKind::Kill) {
+    match signaller.signal_record(record, SignalKind::Kill, approval) {
         Ok(r) => receipts.push(format!("KILL: {r:?}")),
         Err(e) => {
             receipts.push(format!("KILL refused: {e:?}"));
@@ -192,6 +342,7 @@ pub trait SignalExecutor {
         &mut self,
         record: &LabRecord,
         signal: SignalKind,
+        approval: &FreshApproval,
     ) -> Result<SignalReceipt, Refusal>;
 }
 impl SignalExecutor for PidfdSignaller {
@@ -199,8 +350,20 @@ impl SignalExecutor for PidfdSignaller {
         &mut self,
         record: &LabRecord,
         signal: SignalKind,
+        approval: &FreshApproval,
     ) -> Result<SignalReceipt, Refusal> {
-        self.signal(record, signal)
+        self.signal(record, signal, approval)
+    }
+}
+#[cfg(test)]
+pub(crate) fn test_approval(pid: u32, start_ticks: u64) -> FreshApproval {
+    // Test-only bypass for fake executors; production exposes no token constructor.
+    FreshApproval {
+        pid,
+        start_ticks,
+        boot_id: String::new(),
+        uid: 0,
+        executable: String::new(),
     }
 }
 // Dry-run never calls SignalExecutor; no raw-PID signalling API is exposed.
@@ -244,6 +407,89 @@ pub fn rescue_cancels(owner_verdict: Option<bool>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fresh_approval_requires_proven_evidence_and_eligible_policy_decision() {
+        let observed = read_process_tuple(std::process::id()).unwrap();
+        let process = crate::procfs::Process {
+            pid: observed.pid,
+            ppid: 1,
+            pgrp: observed.pid,
+            session: observed.pid,
+            start_ticks: observed.start_ticks,
+            state: 'S',
+            name: "svc".into(),
+            command: "svc".into(),
+            rss_kib: 0,
+            swap_kib: 0,
+            uid: Some(observed.uid),
+        };
+        let inputs = || FreshApprovalInputs {
+            evidence: crate::evidence::AbandonEvidence {
+                lab_member: true,
+                owner: crate::owner::OwnerVerdict::Unclaimed,
+                grace_expired: true,
+                revalidated_now: true,
+                owner_dead: Some(true),
+                last_client_gone: Some(true),
+                no_pending_work: Some(true),
+            },
+            process: process.clone(),
+            protection: crate::protection::Protection {
+                tier: crate::protection::Tier::Known,
+                reason: "test".into(),
+            },
+            policy: crate::policy::Policy::default(),
+            signals: crate::policy::Signals {
+                owner_reports_active: Some(false),
+                proven_abandoned: true,
+                needs_tolerance: false,
+                memory_pressure: false,
+                client_coverage: crate::client_tracker::Coverage::CompleteVerified,
+            },
+        };
+        assert!(approve_fresh(inputs()).is_some());
+        let mut stale = inputs();
+        stale.evidence.revalidated_now = false;
+        assert!(approve_fresh(stale).is_none());
+        let mut protected = inputs();
+        protected.protection.tier = crate::protection::Tier::Absolute;
+        assert!(approve_fresh(protected).is_none());
+    }
+    #[test]
+    fn signal_path_prefers_pidfd_and_uses_classic_only_as_fallback() {
+        assert_eq!(signal_path(true), SignalPath::Pidfd);
+        assert_eq!(signal_path(false), SignalPath::Classic);
+    }
+    #[test]
+    fn approval_bound_to_different_process_refuses_before_official_shutdown() {
+        let mut executor = FakeExecutor::default();
+        let mut official_called = false;
+        let receipts = close_sequence(
+            &LabRecord {
+                pid: 7,
+                start_ticks: 9,
+                spawned_at: 0,
+            },
+            &ClosePolicy {
+                grace_secs: 0,
+                term_wait_secs: 0,
+                allow_sigkill: true,
+            },
+            Some(&test_approval(8, 10)),
+            &mut executor,
+            |_, _, _| true,
+            |_| {},
+            || {
+                official_called = true;
+                "called".into()
+            },
+        );
+        assert!(!official_called);
+        assert!(executor.calls.is_empty());
+        assert!(receipts
+            .iter()
+            .any(|receipt| receipt.contains("approval identity mismatch")));
+    }
     #[derive(Default)]
     struct FakeExecutor {
         calls: Vec<SignalKind>,
@@ -253,6 +499,7 @@ mod tests {
             &mut self,
             _: &LabRecord,
             signal: SignalKind,
+            _: &FreshApproval,
         ) -> Result<SignalReceipt, Refusal> {
             self.calls.push(signal);
             Ok(SignalReceipt {
@@ -275,7 +522,7 @@ mod tests {
                 term_wait_secs: 2,
                 allow_sigkill: true,
             },
-            false,
+            None,
             &mut s,
             |_, _, _| panic!("dry run revalidated"),
             |_| panic!("dry run waited"),
@@ -304,7 +551,7 @@ mod tests {
                 term_wait_secs: 0,
                 allow_sigkill: true,
             },
-            true,
+            Some(&test_approval(7, 9)),
             &mut s,
             |_, _, _| false,
             |_| panic!("must not wait"),
@@ -330,7 +577,7 @@ mod tests {
                 term_wait_secs: 0,
                 allow_sigkill: true,
             },
-            true,
+            Some(&test_approval(7, 9)),
             &mut s,
             |_, _, _| false,
             |_| {},
@@ -356,7 +603,7 @@ mod tests {
                 term_wait_secs: 0,
                 allow_sigkill: true,
             },
-            true,
+            Some(&test_approval(7, 9)),
             &mut s,
             |_, _, _| true,
             |_| {},
@@ -372,7 +619,7 @@ mod tests {
                 term_wait_secs: 0,
                 allow_sigkill: false,
             },
-            true,
+            Some(&test_approval(7, 9)),
             &mut s,
             |_, _, _| true,
             |_| {},
