@@ -25,6 +25,24 @@ pub struct Candidate {
 }
 
 pub fn candidates() -> (Vec<Candidate>, usize) {
+    // One full bounded ambient probe per report call, not one per process.
+    let opencode_state = std::panic::catch_unwind(|| {
+        crate::adapters::OpenCodeProbe {
+            base_url: None,
+            password: None,
+        }
+        .assess()
+    })
+    .unwrap_or_else(|_| evidence::ClientWorkState::Unknown {
+        missing: vec!["OpenCode probe panicked".into()],
+    });
+    // Reporting only: Codex WorkAbsent preserves last_client_gone=None because socket-client
+    // enumeration is unavailable; the engine's conjunctive proof inputs are intentionally untouched.
+    let codex_state =
+        std::panic::catch_unwind(|| crate::adapters::CodexProbe { sock_path: None }.assess())
+            .unwrap_or_else(|_| evidence::ClientWorkState::Unknown {
+                missing: vec!["Codex probe panicked".into()],
+            });
     let outcome = procfs::scan();
     let rel = relations::build(&outcome.processes);
     let uid = crate::own_uid();
@@ -37,6 +55,10 @@ pub fn candidates() -> (Vec<Candidate>, usize) {
             let adapter = crate::adapter_for(&p.name, &p.command);
             let id = identity::identify(p, identity::read_boot_id());
             let live = adapter.liveness(&id);
+            let client_work =
+                (adapter.name() == "opencode").then(|| format!("client_work={opencode_state:?}"));
+            let codex_work =
+                (adapter.name() == "codex").then(|| format!("client_work={codex_state:?}"));
             let owner = owner::resolve(&claims, p);
             let lab_member = crate::lab::current_registry()
                 .unwrap_or_default()
@@ -57,7 +79,7 @@ pub fn candidates() -> (Vec<Candidate>, usize) {
                 memory_pressure: false,
             };
             let decision = policy::decide(&Policy::default(), &prot, p, &signals);
-            let evidence = vec![
+            let mut evidence = vec![
                 format!("owner={owner:?}"),
                 format!("adapter={} liveness={live:?}", adapter.detail()),
                 format!("lab_registry_member={lab_member}"),
@@ -74,6 +96,12 @@ pub fn candidates() -> (Vec<Candidate>, usize) {
                     })
                 ),
             ];
+            if let Some(client_work) = client_work {
+                evidence.push(client_work);
+            }
+            if let Some(codex_work) = codex_work {
+                evidence.push(codex_work);
+            }
             let limitations = vec![
                 "dry-run only; no close action is available".into(),
                 "client and pending-work absence may be unverifiable".into(),

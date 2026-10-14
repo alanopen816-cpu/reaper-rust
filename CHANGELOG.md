@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.5.0-evidence — 2026-10-14 (branch `phase-pilot`, uncommitted feature `reaper-abandonment-evidence`)
+
+Real abandonment evidence for OpenCode + Codex adapters. Zero production
+closures; dry-run everywhere outside lab tests.
+
+Added:
+- `evidence.rs` — `ClientWorkState { Active, IdleVerified, Unknown, Error }`
+  plus Codex-grade `WorkAbsent` → `(None, Some(true))`; `client_work_to_fields`
+  mapping; `proven()` unchanged and conjunctive (verified by tests).
+- `queries.rs` — loopback-guarded OpenCode probes: fast HTTP-direct with
+  preemptive Basic auth via stdin-config (netrc unusable: 401 without
+  WWW-Authenticate), JSON Content-Type for POSTs, CLI-spawn ambient mode
+  (30 s timeout); bounded read-only Codex `sqlite3` counts
+  (`threads`, non-archived, `queued_items`); bare-array parsers.
+- `adapters.rs` — `OpenCodeProbe` full sweep (session.active/list,
+  shell/pty, permission/form global, per-session message/inbox/permission
+  deep-check capped at 10, server-PID TCP counter) + `assess_fast` engine
+  path (never IdleVerified); `CodexProbe` (daemon-version reachability,
+  queued→Active, non-archived→Unknown, zero→WorkAbsent, never
+  IdleVerified); per-query contract documented in code.
+- `main.rs`/`pilot.rs` — engine feeds OpenCode fast-path fields (Unknown
+  dominates; 12 policy rules untouched, Blocked-before-proven holds);
+  pilot report shows one ambient assessment per call for opencode/codex rows.
+- Tests: 78 unit + 2 integration (was 69+2); gated labs
+  `REAPER_LAB_OPENCODE=1` (empty/shell/kill-client/remove/history/auth) and
+  `REAPER_LAB_CODEX=1` (isolated non-tmp HOME, empty→WorkAbsent, exact-HOME
+  daemon cleanup); sqlite fixture-DB tests; secret-redaction tests.
+
+Verified on-device: fmt, clippy `-D warnings`, full suite, release
+(~1.0 MiB), both labs green (OpenCode sweep median ~1.2 s; info 22 ms).
+Live pilot over production (read-only): real OpenCode activity detected as
+Active, Codex reported Unknown with a true 101-thread inventory, every row
+Blocked with proven_abandoned=false. No production process touched.
+
+Known limits: /proc/net/tcp{,6} and /proc/net/unix denied on this Termux →
+client presence permanently Unknown here (kinds indistinguishable);
+Codex RPC framing unverified (all probed framings silent; sqlite path used
+instead); live TUI attach and model-backed Codex activity untested;
+`session.active` empty proves nothing (verified during running shell).
+
 ## v0.4.0-pilot — 2026-10-13 (branch `phase-pilot`, commits `a0402f3`+`a26e888`)
 
 Observation pilot, zero real closures. Dry-run everywhere outside lab tests.

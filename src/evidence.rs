@@ -1,6 +1,35 @@
 use crate::owner::OwnerVerdict;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientWorkState {
+    Active {
+        reason: String,
+    },
+    IdleVerified {
+        surfaces: Vec<String>,
+    },
+    Unknown {
+        missing: Vec<String>,
+    },
+    Error {
+        note: String,
+    },
+    /// Codex-grade: zero work observed, but client presence remains unverified.
+    WorkAbsent {
+        note: String,
+    },
+}
+
+pub fn client_work_to_fields(s: &ClientWorkState) -> (Option<bool>, Option<bool>) {
+    match s {
+        ClientWorkState::Active { .. } => (Some(false), Some(false)),
+        ClientWorkState::IdleVerified { .. } => (Some(true), Some(true)),
+        ClientWorkState::WorkAbsent { .. } => (None, Some(true)),
+        ClientWorkState::Unknown { .. } | ClientWorkState::Error { .. } => (None, None),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbandonEvidence {
     pub lab_member: bool,
     pub owner: OwnerVerdict,
@@ -98,5 +127,74 @@ mod tests {
             service: "client".into(),
         };
         assert!(!proven(&ev));
+    }
+
+    #[test]
+    fn client_work_states_map_conjunctively_and_rescue_invalidates() {
+        let states = [
+            (
+                ClientWorkState::Active {
+                    reason: "work".into(),
+                },
+                (Some(false), Some(false)),
+            ),
+            (
+                ClientWorkState::IdleVerified {
+                    surfaces: vec!["session".into()],
+                },
+                (Some(true), Some(true)),
+            ),
+            (
+                ClientWorkState::Unknown {
+                    missing: vec!["clients".into()],
+                },
+                (None, None),
+            ),
+            (
+                ClientWorkState::Error {
+                    note: "probe failed".into(),
+                },
+                (None, None),
+            ),
+            (
+                ClientWorkState::WorkAbsent {
+                    note: "no active work".into(),
+                },
+                (None, Some(true)),
+            ),
+        ];
+        for (state, expected) in states {
+            assert_eq!(client_work_to_fields(&state), expected);
+        }
+        for state in [
+            ClientWorkState::Unknown { missing: vec![] },
+            ClientWorkState::Error {
+                note: String::new(),
+            },
+            ClientWorkState::WorkAbsent {
+                note: "zero work, clients unknown".into(),
+            },
+        ] {
+            let (last_client_gone, no_pending_work) = client_work_to_fields(&state);
+            let mut ev = evidence();
+            ev.last_client_gone = last_client_gone;
+            ev.no_pending_work = no_pending_work;
+            assert!(!proven(&ev));
+        }
+        let (last_client_gone, no_pending_work) = client_work_to_fields(&states_idle());
+        let mut ev = evidence();
+        ev.last_client_gone = last_client_gone;
+        ev.no_pending_work = no_pending_work;
+        assert!(proven(&ev));
+        let (last_client_gone, no_pending_work) = client_work_to_fields(&ClientWorkState::Active {
+            reason: "rescue".into(),
+        });
+        ev.last_client_gone = last_client_gone;
+        ev.no_pending_work = no_pending_work;
+        assert!(!proven(&ev));
+    }
+
+    fn states_idle() -> ClientWorkState {
+        ClientWorkState::IdleVerified { surfaces: vec![] }
     }
 }

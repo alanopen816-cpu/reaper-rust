@@ -416,6 +416,18 @@ impl Observer {
                 }
                 owner::OwnerVerdict::Unclaimed => owner::OwnerVerdict::Unclaimed,
             };
+            let client_work = if adapter.name() == "opencode" {
+                adapters::OpenCodeProbe {
+                    base_url: None,
+                    password: None,
+                }
+                .assess_fast()
+            } else {
+                evidence::ClientWorkState::Unknown {
+                    missing: vec!["adapter client/work evidence unavailable".into()],
+                }
+            };
+            let (last_client_gone, no_pending_work) = evidence::client_work_to_fields(&client_work);
             let ev = evidence::AbandonEvidence {
                 lab_member,
                 owner: owner_evidence,
@@ -426,9 +438,8 @@ impl Observer {
                     Some(true) => Some(false),
                     None => None,
                 },
-                // OpenCode and Codex expose no official client/work-list API here.
-                last_client_gone: None,
-                no_pending_work: None,
+                last_client_gone,
+                no_pending_work,
             };
             let _absence = evidence::positive_vs_absent(&ev);
             let signals = Signals {
