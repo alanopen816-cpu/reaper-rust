@@ -335,6 +335,8 @@ struct Observer {
     deep_scheduler: pilot::DeepScheduler,
     context_snapshot: HashMap<u32, (identity::ProcessIdentity, u32, u32)>,
     owner_snapshot: HashMap<u32, (identity::ProcessIdentity, String)>,
+    emergency_stop_file: PathBuf,
+    recovery_faulted: bool,
 }
 
 static PILOT_READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -363,6 +365,8 @@ impl Observer {
         let self_pid = std::process::id();
         let uid = own_uid();
         let now = logx::now_secs();
+        let emergency_stop = state::EmergencyStop::is_engaged_at(&self.emergency_stop_file)?;
+        let faulted = self.recovery_faulted || outcome.skipped_stat + outcome.skipped_mismatch > 0;
 
         let durable_before = self.supervisor.identity_snapshot();
         let durable_now: Vec<_> = outcome
@@ -736,6 +740,15 @@ impl Observer {
                 &signals,
                 &[],
             );
+            if emergency_stop || faulted {
+                decision = Decision::Blocked {
+                    reason: if emergency_stop {
+                        "emergency stop engaged".into()
+                    } else {
+                        "operational evidence fault; automatic action blocked".into()
+                    },
+                };
+            }
             if class == identity::ProcessClass::Unknown {
                 unknown_rows += 1;
                 let name = adapter.name();
@@ -756,7 +769,9 @@ impl Observer {
                             .into(),
                     }
                 };
-                if !PILOT_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+                if !PILOT_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+                    && state::grace_start_allowed(emergency_stop, faulted)
+                {
                     if let Some(entry) = lab::current_registry()?
                         .into_iter()
                         .find(|entry| entry.pid == p.pid && entry.start_ticks == p.start_ticks)
@@ -864,7 +879,9 @@ impl Observer {
                         t.reason
                     ),
                 )?;
-                if matches!(next, State::GracePeriod) {
+                if matches!(next, State::GracePeriod)
+                    && state::grace_start_allowed(emergency_stop, faulted)
+                {
                     let grace = match &decision {
                         Decision::GraceCandidate { grace_secs, .. } => *grace_secs,
                         _ => self.policy.grace_known_secs,
@@ -948,6 +965,10 @@ fn cmd_lab() -> io::Result<()> {
 }
 
 fn cmd_close(pid: u32, act: bool) -> io::Result<()> {
+    if state::EmergencyStop::is_engaged_at(&logx::default_state_dir().join("emergency-stop"))? {
+        println!("close receipt: refused; emergency stop engaged; no signal");
+        return Ok(());
+    }
     let Some(entry) = lab::current_registry()?.into_iter().find(|e| e.pid == pid) else {
         println!("close receipt: refused; PID is not in lab registry; no signal");
         return Ok(());
@@ -1092,13 +1113,16 @@ fn cmd_observe(
         );
         eprintln!("state recovery: {recovery}; observer continues with fresh state");
     }
+    let restart_faulted = if pilot_read_only {
+        pilot::heartbeat_gap(state_dir, interval, outcome.processes.len())?.is_some()
+    } else {
+        false
+    };
+    let recovery_faulted = supervisor.recovery_message().is_some() || restart_faulted;
     let usage_start = stats::self_usage();
     logx::log(&log_cfg, logx::Level::Info, "observer.started",
         &format!("read_only=true recovered={kept} discarded_recycled={discarded} pidfd={} interval={interval}",
             identity::pidfd_status()))?;
-    if pilot_read_only {
-        pilot::heartbeat(state_dir, interval, outcome.processes.len())?;
-    }
     logx::enforce_retention(&log_cfg, &{
         let (y, m, d) = logx::civil_date((logx::now_secs() / 86400) as i64);
         format!("{y:04}-{m:02}-{d:02}")
@@ -1118,6 +1142,8 @@ fn cmd_observe(
         deep_scheduler: pilot::DeepScheduler::default(),
         context_snapshot: HashMap::new(),
         owner_snapshot: HashMap::new(),
+        emergency_stop_file: state_dir.join("emergency-stop"),
+        recovery_faulted,
     };
     let mut failures = 0u32;
     loop {
@@ -1205,6 +1231,10 @@ fn main() {
             }
         }
         Some("lab") => cmd_lab(),
+        Some("emergency-stop") => {
+            state::EmergencyStop::engage_at(&PathBuf::from(&state_dir).join("emergency-stop"))
+                .map(|()| println!("emergency stop engaged; observation remains available"))
+        }
         Some("close") => {
             let pid = args
                 .iter()
@@ -1423,6 +1453,8 @@ mod pilot_gap_tests {
             deep_scheduler: pilot::DeepScheduler::default(),
             context_snapshot: HashMap::new(),
             owner_snapshot: HashMap::new(),
+            emergency_stop_file: std::env::temp_dir().join("reaper-test-no-estop"),
+            recovery_faulted: false,
         };
         (obs, root, pid)
     }
@@ -1479,6 +1511,8 @@ mod pilot_gap_tests {
             deep_scheduler: pilot::DeepScheduler::default(),
             context_snapshot: HashMap::new(),
             owner_snapshot: HashMap::new(),
+            emergency_stop_file: std::env::temp_dir().join("reaper-test-no-estop"),
+            recovery_faulted: false,
         };
 
         observer.cycle().expect("observer cycle");

@@ -65,6 +65,48 @@ struct ServiceState {
 }
 type Ledger = Arc<Mutex<ServiceState>>;
 
+/// Explicit retry budget for a service registered as managed. Each successful
+/// request consumes one slot; callers must sleep for the returned backoff.
+#[allow(dead_code)]
+pub(crate) struct RestartBudget {
+    cap: u32,
+    used: u32,
+    base: Duration,
+}
+
+#[allow(dead_code)]
+impl RestartBudget {
+    pub(crate) fn new(cap: u32, base: Duration) -> Self {
+        Self { cap, used: 0, base }
+    }
+
+    pub(crate) fn restart(
+        &mut self,
+        managed: bool,
+        authorized: bool,
+        restart: impl FnOnce(u32) -> io::Result<()>,
+    ) -> io::Result<Duration> {
+        if !managed || !authorized {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed restart authorization required",
+            ));
+        }
+        if self.used >= self.cap {
+            return Err(io::Error::other("managed restart retry cap reached"));
+        }
+        self.used += 1;
+        restart(self.used)?;
+        let multiplier = 1u32
+            .checked_shl(self.used.saturating_sub(1).min(16))
+            .unwrap_or(u32::MAX);
+        Ok(self
+            .base
+            .saturating_mul(multiplier)
+            .min(Duration::from_secs(300)))
+    }
+}
+
 fn start_ticks(pid: u32) -> io::Result<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let end = stat
@@ -94,6 +136,43 @@ fn tcp_listener_present() -> io::Result<bool> {
 #[cfg(test)]
 mod tcp_listener_tests {
     use super::*;
+
+    #[test]
+    fn managed_restart_budget_enforces_cap_and_authorization() {
+        let mut budget = RestartBudget::new(2, Duration::from_secs(1));
+        let mut calls = 0;
+        assert!(budget
+            .restart(true, true, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_ok());
+        assert!(budget
+            .restart(true, true, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_ok());
+        assert!(budget
+            .restart(true, true, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_err());
+        assert!(budget
+            .restart(false, true, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_err());
+        assert!(budget
+            .restart(true, false, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(calls, 2);
+    }
 
     #[test]
     fn tcp_listener_table_parser_detects_listen_state() {
@@ -818,8 +897,48 @@ pub(crate) fn close_ready_service(
     socket: &std::path::Path,
 ) -> io::Result<Vec<String>> {
     use crate::terminate::{ClosePolicy, LabRecord, PidfdSignaller};
-    let (approval, _) = fresh_lab_approval(entry, socket, true)?;
-    crate::lab::persist_close_receipt(entry, &["attested close authorized".into()], "in_progress")?;
+    let authorization = crate::lab::authorization_for(
+        entry,
+        format!("fresh-approval:{}:{}", entry.pid, entry.start_ticks),
+    );
+    let requested_scope = crate::terminate::close_scope(
+        &format!("{}:{}", entry.pid, entry.start_ticks),
+        &crate::lab::registry_path_current().display().to_string(),
+        "reaper-lab",
+    );
+    if !authorization.authorizes(&requested_scope) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "close authorization scope mismatch",
+        ));
+    }
+    let (approval, report) = fresh_lab_approval(entry, socket, true)?;
+    let audit = vec![
+        format!(
+            "identity=pid:{}:start:{}:spawned:{}",
+            entry.pid, entry.start_ticks, entry.spawned_at
+        ),
+        format!(
+            "evidence_snapshot_ref=managed-attestation:{}:{}:{}",
+            entry.pid,
+            entry.start_ticks,
+            crate::logx::now_secs()
+        ),
+        "policy_id=managed-lab-close;policy_version=1".into(),
+        format!(
+            "authorization_scope=service:{}:{};registry:{};project:reaper-lab",
+            entry.pid,
+            entry.start_ticks,
+            crate::lab::registry_path_current().display()
+        ),
+        format!(
+            "fresh_approval_ref=fresh-approval:{}:{}",
+            entry.pid, entry.start_ticks
+        ),
+        format!("grace_start=prevalidated;grace_end=expired;revalidation={report:?}"),
+        "mechanism=managed-service-uds-official-shutdown+pidfd-term".into(),
+    ];
+    crate::lab::persist_close_receipt(entry, &audit, "in_progress")?;
     let record = LabRecord {
         pid: entry.pid,
         start_ticks: entry.start_ticks,
@@ -1138,6 +1257,8 @@ pub fn run_demo(grace_secs: u64) -> io::Result<()> {
         deep_scheduler: crate::pilot::DeepScheduler::default(),
         context_snapshot: std::collections::HashMap::new(),
         owner_snapshot: std::collections::HashMap::new(),
+        emergency_stop_file: root.join("emergency-stop"),
+        recovery_faulted: false,
     };
     observer.cycle()?;
     if observer.supervisor.state_of(entry.pid) != Some(crate::state::State::Observing) {

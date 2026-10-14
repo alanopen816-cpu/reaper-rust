@@ -22,6 +22,40 @@ pub struct FreshApproval {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationScope {
+    pub service_id: String,
+    pub registry: String,
+    pub project: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedAuthorization {
+    pub scope: AuthorizationScope,
+    pub fresh_approval_ref: String,
+}
+
+impl ScopedAuthorization {
+    pub fn new(scope: AuthorizationScope, fresh_approval_ref: String) -> Self {
+        Self {
+            scope,
+            fresh_approval_ref,
+        }
+    }
+
+    pub fn authorizes(&self, requested: &AuthorizationScope) -> bool {
+        !self.fresh_approval_ref.is_empty() && self.scope == *requested
+    }
+}
+
+pub fn close_scope(service_id: &str, registry: &str, project: &str) -> AuthorizationScope {
+    AuthorizationScope {
+        service_id: service_id.to_owned(),
+        registry: registry.to_owned(),
+        project: project.to_owned(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessTuple {
     pid: u32,
     start_ticks: u64,
@@ -414,6 +448,22 @@ pub fn rescue_cancels(owner_verdict: Option<bool>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn close_authorization_scope_is_exact_and_service_bound() {
+        let a = AuthorizationScope {
+            service_id: "service-A".into(),
+            registry: "registry".into(),
+            project: "project".into(),
+        };
+        let b = AuthorizationScope {
+            service_id: "service-B".into(),
+            registry: "registry".into(),
+            project: "project".into(),
+        };
+        let authorization = ScopedAuthorization::new(a.clone(), "approval-1".into());
+        assert!(authorization.authorizes(&a));
+        assert!(!authorization.authorizes(&b));
+    }
     #[test]
     fn fresh_approval_requires_proven_evidence_and_eligible_policy_decision() {
         let observed = read_process_tuple(std::process::id()).unwrap();

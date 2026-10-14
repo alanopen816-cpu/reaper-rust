@@ -40,6 +40,52 @@ fn invalid_state(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
+/// Persistent kill switch for automatic actuation. Presence is fail-closed;
+/// observation and state persistence remain available.
+pub struct EmergencyStop;
+
+impl EmergencyStop {
+    pub fn is_engaged_at(path: &Path) -> std::io::Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn engage_at(path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        use std::io::Write;
+        writeln!(file, "REAPER_ESTOP_V1")?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+pub fn grace_start_allowed(emergency_stop: bool, faulted: bool) -> bool {
+    !emergency_stop && !faulted
+}
+
 fn archive_invalid_state(path: &Path) -> String {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -467,6 +513,26 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::identity::ProcessIdentity;
+
+    #[test]
+    fn emergency_stop_persists_across_reload_and_blocks_grace() {
+        let dir = std::env::temp_dir().join(format!(
+            "reaper-estop-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let stop_file = dir.join("emergency-stop");
+        EmergencyStop::engage_at(&stop_file).unwrap();
+        assert!(EmergencyStop::is_engaged_at(&stop_file).unwrap());
+        assert!(!grace_start_allowed(true, false));
+        assert!(!grace_start_allowed(false, true));
+        assert!(grace_start_allowed(false, false));
+        let _ = fs::remove_dir_all(dir);
+    }
 
     fn id(pid: u32, start: u64) -> ProcessIdentity {
         ProcessIdentity {

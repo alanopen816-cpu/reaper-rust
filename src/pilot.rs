@@ -540,6 +540,14 @@ fn heartbeat_at(
 }
 
 pub fn heartbeat(state_dir: &Path, interval: u64, entries: usize) -> io::Result<()> {
+    heartbeat_gap(state_dir, interval, entries).map(|_| ())
+}
+
+pub fn heartbeat_gap(
+    state_dir: &Path,
+    interval: u64,
+    entries: usize,
+) -> io::Result<Option<String>> {
     fs::create_dir_all(state_dir)?;
     heartbeat_at(
         state_dir,
@@ -549,7 +557,6 @@ pub fn heartbeat(state_dir: &Path, interval: u64, entries: usize) -> io::Result<
         monotonic_secs()?,
         entries,
     )
-    .map(|_| ())
 }
 
 pub struct ObserverLock(std::path::PathBuf);

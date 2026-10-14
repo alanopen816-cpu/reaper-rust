@@ -169,6 +169,19 @@ pub fn receipt_path_current() -> PathBuf {
     registry_path().with_extension("receipts.jsonl")
 }
 
+pub fn authorization_for(
+    entry: &Entry,
+    approval_ref: String,
+) -> crate::terminate::ScopedAuthorization {
+    let service_id = format!("{}:{}", entry.pid, entry.start_ticks);
+    let scope = crate::terminate::close_scope(
+        &service_id,
+        &registry_path().display().to_string(),
+        "reaper-lab",
+    );
+    crate::terminate::ScopedAuthorization::new(scope, approval_ref)
+}
+
 pub fn persist_close_receipt(entry: &Entry, stages: &[String], verdict: &str) -> io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     static RECEIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
