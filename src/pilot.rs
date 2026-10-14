@@ -102,9 +102,18 @@ pub fn candidates() -> (Vec<Candidate>, usize) {
             if let Some(codex_work) = codex_work {
                 evidence.push(codex_work);
             }
+            let managed_clients = crate::client_tracker::current_registry()
+                .map(|r| r.clients.len())
+                .unwrap_or(0);
+            let coverage = if crate::client_tracker::coverage_complete() {
+                "full"
+            } else {
+                "managed-only"
+            };
             let limitations = vec![
                 "dry-run only; no close action is available".into(),
                 "client and pending-work absence may be unverifiable".into(),
+                format!("managed_clients={managed_clients}; coverage={coverage}"),
             ];
             Candidate {
                 pid: p.pid,

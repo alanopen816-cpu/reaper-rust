@@ -8,6 +8,7 @@
 //! eligible for the lab-only close path.
 
 mod adapters;
+mod client_tracker;
 mod events;
 mod evidence;
 mod identity;
@@ -24,6 +25,8 @@ mod relations;
 mod state;
 mod stats;
 mod terminate;
+#[cfg(feature = "tui")]
+mod tui;
 
 use adapters::{Codex, GenericLinux, Liveness, McpBroker, OpenCode, OwnerAdapter, RunitService};
 use events::{Event, Tracker};
@@ -403,6 +406,26 @@ impl Observer {
                     "unclaimed".to_string(),
                 ),
             };
+            // Untracked processes remain UnknownExternal until verified managed-client lookup is wired here.
+            let mut managed_registry = client_tracker::current_registry().unwrap_or_default();
+            client_tracker::discard_stale(&mut managed_registry);
+            let managed_record = managed_registry.clients.iter().find(|record| {
+                record.identity.pid == p.pid
+                    && record.identity.start_ticks == p.start_ticks
+                    && record.identity.boot_id == self.boot_id.clone().unwrap_or_default()
+            });
+            let unknown_external = client_tracker::ClientState::UnknownExternal {
+                evidence: "coverage is incomplete".into(),
+                provenance: "managed-only registry; external client roster unavailable".into(),
+            };
+            let managed_state = managed_record
+                .map(|record| &record.state)
+                .unwrap_or(&unknown_external);
+            let tracker_active = client_tracker::tracker_signal(
+                managed_state,
+                managed_record.is_some_and(|record| !record.active_work_ids.is_empty()),
+            );
+            let owner_active = client_tracker::combine_signals(owner_active, tracker_active);
             let lab_member = lab::current_registry()
                 .unwrap_or_default()
                 .iter()
@@ -714,6 +737,19 @@ fn main() {
             }
         }
         Some("scan") => cmd_scan(),
+        Some("tui") => {
+            #[cfg(feature = "tui")]
+            {
+                tui::run()
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "rebuild with --features tui",
+                ))
+            }
+        }
         Some("pilot") => match args.get(2).map(String::as_str) {
             Some("report") => pilot::report(),
             Some("metrics") => pilot::metrics(&PathBuf::from(&state_dir)),
@@ -749,6 +785,7 @@ fn main() {
         _ => {
             println!("Reaper v0.2.0-phase2 (observable supervisor, still read-only)");
             println!("Usage: reaper scan | inspect <PID> | observe [interval_seconds]");
+            println!("       reaper tui");
             println!("       reaper pilot report|metrics|start|status|stop");
             println!("Signals are possible only via close --act for registry-verified lab PIDs.");
             Ok(())

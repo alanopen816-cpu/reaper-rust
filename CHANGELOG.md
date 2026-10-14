@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.6.0-tracking-tui — 2026-10-14 (branch `feature/client-tracking-tui`, base `phase-pilot@1a66949`)
+
+Managed client tracking + phone TUI. Supervision stays singleton, read-only
+and dry-run; no production closures.
+
+Added:
+- `client_tracker.rs` — managed-client registry (stable pid/start/boot
+  identity, 5-state model, job relations persisted incl. round-trip fix,
+  reload-before-write merge), OpenCode launch wrapper (args/env/exit
+  preserved; async signal forwarding documented impossible zero-dep),
+  coverage gate defaulting to incomplete (empty registry never idle).
+- Policy integration — protection-monotone signal combination
+  (active→protect, unknown→block); `proven()` and the 12 rules untouched.
+- `tui.rs` (optional `tui` feature: ratatui+crossterm; default build stays
+  zero-dep) — read-only process/detail/clients/events views, phone-width
+  adaptive, arrows//Enter/t/s/l/q, fast in-process snapshots (0.03 s),
+  no destructive bindings, observer-only (full evidence stays in
+  `pilot report`).
+- `tests/client_coverage.rs` — loopback accept-proxy prototype proving
+  per-connection visibility for proxied traffic only, plus lab
+  end-to-end transparency test (correct /api/info + auth forwarding).
+- `odd/research/client-coverage.md` — per-mechanism contract and
+  ManagedOnly recommendation.
+
+Verified on-device: fmt, clippy ×2 feature sets, tests 88+2+2 default and
+93+2+2 with tui, release 1.0 MiB default / 1.5 MiB tui, autonomy labs
+(abrupt death, 2-client cycle+restart, concurrent observers, coverage
+proxy) green with no strays, TUI pty demo rendering real rows with clean
+`q` quit. Two real bugs caught by tests: concurrent wrapper completion
+lost updates; work-ids dropped on decode — both fixed with regression
+tests. Full-suite wall time grew (ambient CLI probes dominate one-shot
+reports; documented).
+
+Known limits: external/unmanaged clients permanently Unknown here
+(procfs net denied, no client-list APIs); TUI shows CPU as `—`
+(snapshot carries none); wrapper cannot forward async signals zero-dep;
+live TUI attach and model-backed Codex activity untested; first real
+close still requires presence signal + human review + explicit RDD.
+
 ## v0.5.0-evidence — 2026-10-14 (branch `phase-pilot`, uncommitted feature `reaper-abandonment-evidence`)
 
 Real abandonment evidence for OpenCode + Codex adapters. Zero production
