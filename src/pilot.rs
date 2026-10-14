@@ -108,6 +108,10 @@ fn candidates_with_metrics() -> (Vec<Candidate>, usize, InspectionMetrics) {
                 let lab_member = lab_registry
                     .iter()
                     .any(|e| e.pid == p.pid && e.start_ticks == p.start_ticks);
+                let coverage = client_registry
+                    .as_ref()
+                    .map(|registry| crate::client_tracker::registry_coverage(&Ok(registry.clone())))
+                    .unwrap_or(crate::client_tracker::Coverage::Broken);
                 let signals = Signals {
                     owner_reports_active: match (owner.clone(), live) {
                         (owner::OwnerVerdict::ClaimedActive { .. }, _) | (_, Liveness::Alive) => {
@@ -121,6 +125,7 @@ fn candidates_with_metrics() -> (Vec<Candidate>, usize, InspectionMetrics) {
                     proven_abandoned: false,
                     needs_tolerance: false,
                     memory_pressure: false,
+                    client_coverage: coverage,
                 };
                 let decision = policy::decide(&Policy::default(), &prot, p, &signals);
                 let mut evidence = vec![
@@ -147,15 +152,13 @@ fn candidates_with_metrics() -> (Vec<Candidate>, usize, InspectionMetrics) {
                     evidence.push(codex_work);
                 }
                 let managed_clients = managed_clients.unwrap_or(0);
-                let coverage = if crate::client_tracker::coverage_complete() {
-                    "full"
-                } else {
-                    "managed-only"
-                };
                 let limitations = vec![
                     "dry-run only; no close action is available".into(),
                     "client and pending-work absence may be unverifiable".into(),
-                    format!("managed_clients={managed_clients}; coverage={coverage}"),
+                    format!(
+                        "managed_clients={managed_clients}; coverage={:?}",
+                        signals.client_coverage
+                    ),
                 ];
                 Candidate {
                     pid: p.pid,

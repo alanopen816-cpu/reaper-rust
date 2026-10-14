@@ -13,6 +13,7 @@ mod events;
 mod evidence;
 mod identity;
 mod lab;
+mod lab_coverage;
 mod logx;
 mod owner;
 mod pidfd;
@@ -180,6 +181,7 @@ fn cmd_inspect(pid: u32) -> io::Result<()> {
         proven_abandoned: false,
         needs_tolerance: false,
         memory_pressure: false,
+        client_coverage: client_tracker::Coverage::Unknown,
     };
     let decision = policy::decide(&Policy::default(), &prot, p, &signals);
     let node = rel.nodes.get(&pid);
@@ -407,7 +409,9 @@ impl Observer {
                 ),
             };
             // Untracked processes remain UnknownExternal until verified managed-client lookup is wired here.
-            let mut managed_registry = client_tracker::current_registry().unwrap_or_default();
+            let client_registry_result = client_tracker::current_registry();
+            let coverage = client_tracker::registry_coverage(&client_registry_result);
+            let mut managed_registry = client_registry_result.unwrap_or_default();
             client_tracker::discard_stale(&mut managed_registry);
             let managed_record = managed_registry.clients.iter().find(|record| {
                 record.identity.pid == p.pid
@@ -470,6 +474,7 @@ impl Observer {
                 proven_abandoned: evidence::proven(&ev),
                 needs_tolerance: false,
                 memory_pressure: false,
+                client_coverage: coverage,
             };
             let decision = policy::decide(&self.policy, &prot, p, &signals);
             let current = self.supervisor.state_of(p.pid);

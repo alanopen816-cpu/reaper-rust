@@ -1,6 +1,6 @@
 //! Restart-safe, conservative registry for wrapper-managed clients.
 //!
-//! Coverage remains ManagedOnly: external clients cannot be enumerated reliably
+//! Coverage remains incomplete: external clients cannot be enumerated reliably
 //! on this device. The wrapper spawns and waits, but cannot forward async signals
 //! without libc; it records only after child completion.
 use std::fs::{self, OpenOptions};
@@ -55,6 +55,40 @@ pub struct ClientRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Registry {
     pub clients: Vec<ClientRecord>,
+}
+
+/// How much of the client population can be safely reasoned about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coverage {
+    CompleteVerified,
+    Partial,
+    Unknown,
+    Broken,
+}
+
+/// Complete coverage is only constructible from affirmative transport and
+/// connection-path evidence. Proxies and registries alone are insufficient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CoverageProof {
+    pub all_transports_observed: bool,
+    pub no_uncontrolled_path: bool,
+    pub source_healthy: bool,
+}
+
+#[allow(dead_code)]
+impl CoverageProof {
+    pub fn coverage(self) -> Coverage {
+        if !self.source_healthy {
+            Coverage::Broken
+        } else if self.all_transports_observed && self.no_uncontrolled_path {
+            Coverage::CompleteVerified
+        } else if self.all_transports_observed || self.no_uncontrolled_path {
+            Coverage::Partial
+        } else {
+            Coverage::Unknown
+        }
+    }
 }
 
 fn registry_path() -> PathBuf {
@@ -302,6 +336,25 @@ pub fn tracker_signal(state: &ClientState, has_active_work: bool) -> Option<bool
         | ClientState::Unverifiable { .. } => None,
     }
 }
+pub fn registry_coverage(result: &io::Result<Registry>) -> Coverage {
+    match result {
+        Err(_) => Coverage::Broken,
+        Ok(registry) if registry.clients.is_empty() => Coverage::Unknown,
+        Ok(registry)
+            if registry.clients.iter().any(|client| {
+                matches!(
+                    client.state,
+                    ClientState::UnknownExternal { .. }
+                        | ClientState::Unverifiable { .. }
+                        | ClientState::PossiblyGone { .. }
+                )
+            }) =>
+        {
+            Coverage::Partial
+        }
+        Ok(_) => Coverage::Partial,
+    }
+}
 pub fn combine_signals(owner_active: Option<bool>, tracker_active: Option<bool>) -> Option<bool> {
     match (owner_active, tracker_active) {
         (Some(true), _) | (_, Some(true)) => Some(true),
@@ -309,14 +362,13 @@ pub fn combine_signals(owner_active: Option<bool>, tracker_active: Option<bool>)
         _ => Some(false),
     }
 }
-/// ManagedOnly is the default until a future source proves complete coverage.
-pub fn coverage_complete() -> bool {
-    // Hook: only a verified full-coverage source may ever return true here.
-    false
+/// Registry-only coverage cannot establish whole-server transport coverage.
+pub fn coverage() -> Coverage {
+    Coverage::Unknown
 }
 #[allow(dead_code)]
 pub fn can_claim_idle() -> bool {
-    coverage_complete()
+    coverage() == Coverage::CompleteVerified
 }
 
 #[allow(dead_code)]
@@ -568,8 +620,76 @@ mod tests {
     fn empty_registry_never_claims_idle() {
         let empty = Registry::default();
         assert!(empty.clients.is_empty());
-        assert!(!coverage_complete());
+        assert_eq!(coverage(), Coverage::Unknown);
         assert!(!can_claim_idle());
+    }
+
+    #[test]
+    fn complete_coverage_requires_both_transport_and_path_proofs() {
+        let complete = CoverageProof {
+            all_transports_observed: true,
+            no_uncontrolled_path: true,
+            source_healthy: true,
+        };
+        assert_eq!(complete.coverage(), Coverage::CompleteVerified);
+        for proof in [
+            CoverageProof {
+                all_transports_observed: false,
+                ..complete
+            },
+            CoverageProof {
+                no_uncontrolled_path: false,
+                ..complete
+            },
+        ] {
+            assert_ne!(proof.coverage(), Coverage::CompleteVerified);
+        }
+        assert_eq!(
+            CoverageProof {
+                source_healthy: false,
+                ..complete
+            }
+            .coverage(),
+            Coverage::Broken
+        );
+    }
+
+    #[test]
+    fn wrapper_and_empty_or_partial_registry_never_prove_complete_coverage() {
+        assert_eq!(coverage(), Coverage::Unknown);
+        assert_eq!(
+            registry_coverage(&Ok(Registry::default())),
+            Coverage::Unknown
+        );
+        let mut registry = Registry {
+            clients: vec![sample(states()[0].clone())],
+        };
+        assert_eq!(registry_coverage(&Ok(registry.clone())), Coverage::Partial);
+        registry.clients.push(sample(ClientState::UnknownExternal {
+            evidence: "outside tracker".into(),
+            provenance: "external".into(),
+        }));
+        assert_eq!(registry_coverage(&Ok(registry)), Coverage::Partial);
+        assert_eq!(
+            registry_coverage(&Err(io::Error::other("read failed"))),
+            Coverage::Broken
+        );
+    }
+
+    #[test]
+    fn proxy_and_direct_bypass_degrade_coverage() {
+        let proxy_only = CoverageProof {
+            all_transports_observed: true,
+            no_uncontrolled_path: false,
+            source_healthy: true,
+        };
+        assert_eq!(proxy_only.coverage(), Coverage::Partial);
+        let bypass = CoverageProof {
+            all_transports_observed: false,
+            no_uncontrolled_path: false,
+            source_healthy: true,
+        };
+        assert_eq!(bypass.coverage(), Coverage::Unknown);
     }
     #[test]
     fn combine_is_protection_monotone_over_all_nine_pairs() {

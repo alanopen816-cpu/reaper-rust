@@ -47,7 +47,7 @@ pub enum Decision {
 
 /// Inputs the policy reasons over. Everything Option/unknown defaults to
 /// the safe side: unverifiable => Blocked/KeepProtected, never candidate.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Signals {
     /// Owner/adapter liveness: Some(true)=active clients/tasks, Some(false)=
     /// proven idle by its owner, None=unverifiable.
@@ -58,6 +58,20 @@ pub struct Signals {
     pub needs_tolerance: bool,
     /// Memory pressure observed (informational: must not override protection).
     pub memory_pressure: bool,
+    /// Incomplete client observation must never arm automatic close/grace.
+    pub client_coverage: crate::client_tracker::Coverage,
+}
+
+impl Default for Signals {
+    fn default() -> Self {
+        Self {
+            owner_reports_active: None,
+            proven_abandoned: false,
+            needs_tolerance: false,
+            memory_pressure: false,
+            client_coverage: crate::client_tracker::Coverage::Unknown,
+        }
+    }
 }
 
 pub fn decide(
@@ -104,6 +118,14 @@ pub fn decide(
         return Decision::KeepProtected {
             tier: tier.tier,
             reason: format!("contextual shared/service: {}", tier.reason),
+        };
+    }
+    if signals.client_coverage != crate::client_tracker::Coverage::CompleteVerified {
+        return Decision::Blocked {
+            reason: format!(
+                "client coverage {:?}; auto-close not authorized",
+                signals.client_coverage
+            ),
         };
     }
     // Rule 8: known services become candidates only with sufficient evidence
@@ -162,6 +184,7 @@ mod tests {
             proven_abandoned: true,
             needs_tolerance: false,
             memory_pressure: false,
+            client_coverage: crate::client_tracker::Coverage::CompleteVerified,
         }
     }
 
@@ -212,6 +235,25 @@ mod tests {
             decide(&Policy::default(), &prot(Tier::Known), &p, &s),
             Decision::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn incomplete_coverage_blocks_even_otherwise_proven_candidate() {
+        let p = proc();
+        for coverage in [
+            crate::client_tracker::Coverage::Partial,
+            crate::client_tracker::Coverage::Unknown,
+            crate::client_tracker::Coverage::Broken,
+        ] {
+            let signals = Signals {
+                client_coverage: coverage,
+                ..known_idle()
+            };
+            assert!(matches!(
+                decide(&Policy::default(), &prot(Tier::Known), &p, &signals),
+                Decision::Blocked { .. }
+            ));
+        }
     }
 
     #[test]
