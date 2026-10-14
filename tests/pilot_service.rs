@@ -95,3 +95,163 @@ fn managed_service_is_a_real_loopback_process_with_verifiable_identity() {
     assert_eq!(request(address, "SHUTDOWN\n"), "CLOSING\n");
     assert!(restarted.wait().unwrap().success());
 }
+
+#[cfg(unix)]
+#[test]
+fn unix_service_reports_kernel_supplied_scm_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+
+    let root = std::env::temp_dir().join(format!(
+        "reaper-peercred-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = root.join("service.sock");
+    let client_registry = root.join("clients.json");
+    let client_pid = std::process::id();
+    let client_ticks = start_ticks(client_pid);
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .unwrap()
+        .trim()
+        .to_owned();
+    std::fs::write(
+        &client_registry,
+        format!(
+            "{{\"clients\":[{{\"tool\":\"test-agent\",\"project\":\"test\",\"server\":\"{}\",\"nonce\":\"test-peer\",\"pid\":{},\"start_ticks\":{},\"boot_id\":\"{}\",\"state\":\"EndedVerified\",\"evidence\":\"test-spawn roster\",\"provenance\":\"test parent registered child\",\"jobs\":[]}}]}}\n",
+            socket_path.display(), client_pid, client_ticks, boot_id
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_reaper"))
+        .args(["managed-service", "serve-uds"])
+        .env("REAPER_LAB_SERVICE_SOCKET", &socket_path)
+        .env("REAPER_LAB_REGISTRY", root.join("lab.json"))
+        .env("REAPER_CLIENT_REGISTRY", &client_registry)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    out.read_line(&mut ready).unwrap();
+    assert!(ready.starts_with("UDS "), "service readiness: {ready:?}");
+
+    let mut client = UnixStream::connect(&socket_path).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client.write_all(b"REGISTER test-peer\n").unwrap();
+    let mut registered = String::new();
+    client.read_to_string(&mut registered).unwrap();
+    assert!(registered.starts_with(&format!("REGISTERED {} ", std::process::id())));
+    drop(client);
+
+    let mut client = UnixStream::connect(&socket_path).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client.write_all(b"PING\n").unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    let fields: Vec<_> = response.split_whitespace().collect();
+    assert_eq!(fields.first(), Some(&"PEER"));
+    assert_eq!(
+        fields.get(1).unwrap().parse::<u32>().unwrap(),
+        std::process::id()
+    );
+    assert_eq!(
+        fields.get(2).unwrap().parse::<u32>().unwrap(),
+        current_uid()
+    );
+    let attestation = {
+        let mut stream = UnixStream::connect(&socket_path).unwrap();
+        stream.write_all(b"ATTEST\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    };
+    let attestation_fields: Vec<_> = attestation.split_whitespace().collect();
+    assert_eq!(attestation_fields.first(), Some(&"OBSERVATION"));
+    assert_eq!(attestation_fields.len(), 9);
+    assert_eq!(&attestation_fields[5..], &["1", "1", "1", "1"]);
+    let mut unregistered = UnixStream::connect(&socket_path).unwrap();
+    unregistered.write_all(b"REGISTER rogue-peer\n").unwrap();
+    let mut refused = String::new();
+    unregistered.read_to_string(&mut refused).unwrap();
+    assert_eq!(refused, "REFUSED unregistered_lab_identity\n");
+    let mut close = UnixStream::connect(&socket_path).unwrap();
+    close.write_all(b"SHUTDOWN\n").unwrap();
+    let mut response = String::new();
+    close.read_to_string(&mut response).unwrap();
+    assert_eq!(response, "CLOSING\n");
+    drop(close);
+    assert!(child.wait().unwrap().success());
+}
+
+fn current_uid() -> u32 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn production_sentinel() -> Option<(u32, u64)> {
+    for item in std::fs::read_dir("/proc").ok()? {
+        let item = item.ok()?;
+        let pid = item.file_name().to_string_lossy().parse::<u32>().ok();
+        let Some(pid) = pid else { continue };
+        let exe = std::fs::read_link(item.path().join("exe")).ok()?;
+        if !exe.to_string_lossy().contains("/opencode") {
+            continue;
+        }
+        let stat = std::fs::read_to_string(item.path().join("stat")).ok()?;
+        let end = stat.rfind(')')?;
+        let ticks = stat[end + 1..].split_whitespace().nth(19)?.parse().ok()?;
+        return Some((pid, ticks));
+    }
+    None
+}
+
+#[cfg(unix)]
+#[test]
+fn observer_drives_short_grace_reconnect_cycle_and_closes_only_demo() {
+    let sentinel = production_sentinel().expect("production OpenCode sentinel is running");
+    let output = Command::new(env!("CARGO_BIN_EXE_reaper"))
+        .args(["managed-service", "demo", "--grace-secs", "2"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "demo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8_lossy(&output.stdout);
+    for step in 1..=18 {
+        assert!(
+            report.contains(&format!("STEP {step:02}")),
+            "missing step {step}: {report}"
+        );
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", sentinel.0)).unwrap();
+    let end = stat.rfind(')').unwrap();
+    let ticks: u64 = stat[end + 1..]
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(ticks, sentinel.1, "production sentinel identity changed");
+}

@@ -341,6 +341,20 @@ impl Observer {
     fn cycle(&mut self) -> io::Result<stats::CycleStats> {
         let mut st = stats::CycleStats::new(&self.log_cfg.dir);
         let outcome = procfs::scan();
+        // The controlled demo exercises the same Observer path but limits its
+        // expensive per-process probes to one currently registered lab target.
+        // Normal observe mode has no target variable and retains the full scan.
+        let lab_observer_target = std::env::var("REAPER_LAB_OBSERVER_TARGET")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| {
+                lab::current_registry().ok().is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.pid == *pid
+                            && lab::identity_ticks(*pid).ok() == Some(entry.start_ticks)
+                    })
+                })
+            });
         st.inspected = outcome.processes.len();
         st.skipped = outcome.skipped_stat + outcome.skipped_mismatch;
         let rel = relations::build(&outcome.processes);
@@ -512,6 +526,9 @@ impl Observer {
         let mut unknown_rows = 0usize;
         let mut deep_targets = Vec::new();
         for p in &outcome.processes {
+            if lab_observer_target.is_some_and(|target| target != p.pid) {
+                continue;
+            }
             let id = identity::identify(p, self.boot_id.clone());
             // Recycled PID under a live tracking key: prior state is void.
             if let Some(stored) = self.supervisor.identity_of(p.pid) {
@@ -594,6 +611,28 @@ impl Observer {
                 .unwrap_or_default()
                 .iter()
                 .any(|e| e.pid == p.pid && e.start_ticks == p.start_ticks);
+            #[cfg(unix)]
+            let service_attestation = if lab_member {
+                std::env::var_os("REAPER_LAB_SERVICE_SOCKET").and_then(|path| {
+                    let entry = lab::current_registry()
+                        .ok()?
+                        .into_iter()
+                        .find(|entry| entry.pid == p.pid && entry.start_ticks == p.start_ticks)?;
+                    managed_service::attest_lab_service(&entry, std::path::Path::new(&path)).ok()
+                })
+            } else {
+                None
+            };
+            #[cfg(not(unix))]
+            let service_attestation: Option<managed_service::LabAttestation> = None;
+            let coverage = service_attestation
+                .as_ref()
+                .map(|attestation| attestation.coverage)
+                .unwrap_or(coverage);
+            let owner_active = service_attestation
+                .as_ref()
+                .map(|attestation| Some(attestation.owner_active))
+                .unwrap_or(owner_active);
             let owner_evidence = match owner::resolve(&claims, p) {
                 owner::OwnerVerdict::ClaimedActive { service } => {
                     owner::OwnerVerdict::ClaimedActive { service }
@@ -616,7 +655,24 @@ impl Observer {
             }
             self.owner_snapshot
                 .insert(p.pid, (id.clone(), owner_fingerprint));
-            let client_work = if adapter.name() == "opencode" {
+            let client_work = if service_attestation.is_some() {
+                if service_attestation
+                    .as_ref()
+                    .is_some_and(|attestation| attestation.owner_active)
+                {
+                    evidence::ClientWorkState::Active {
+                        reason: "SCM_CREDENTIALS-verified lab clients or service jobs active"
+                            .into(),
+                    }
+                } else {
+                    evidence::ClientWorkState::IdleVerified {
+                        surfaces: vec![
+                            "0700 Unix-domain socket peer roster".into(),
+                            "authenticated lab job ledger".into(),
+                        ],
+                    }
+                }
+            } else if adapter.name() == "opencode" {
                 adapters::OpenCodeProbe {
                     base_url: None,
                     password: None,
@@ -702,7 +758,21 @@ impl Observer {
                     .into_iter()
                     .find(|entry| entry.pid == p.pid && entry.start_ticks == p.start_ticks)
                 {
-                    match lab::close_ready_entry(&entry) {
+                    #[cfg(unix)]
+                    let close_result =
+                        if let Some(socket) = std::env::var_os("REAPER_LAB_SERVICE_SOCKET") {
+                            let socket = std::path::PathBuf::from(socket);
+                            if managed_service::attest_lab_service(&entry, &socket).is_ok() {
+                                managed_service::close_ready_service(&entry, &socket)
+                            } else {
+                                lab::close_ready_entry(&entry)
+                            }
+                        } else {
+                            lab::close_ready_entry(&entry)
+                        };
+                    #[cfg(not(unix))]
+                    let close_result = lab::close_ready_entry(&entry);
+                    match close_result {
                         Ok(receipts) => {
                             for receipt in receipts {
                                 st.log_bytes += logx::log(
@@ -756,7 +826,7 @@ impl Observer {
             let mut next = decide_state(&decision, current);
             // Grace expiry without new evidence: record readiness, do nothing.
             if current == Some(State::GracePeriod)
-                && matches!(next, State::GracePeriod)
+                && matches!(decision, Decision::GraceCandidate { .. })
                 && self.supervisor.grace_expired(p.pid, now)
             {
                 next = State::ReadyForRevalidation;
@@ -1038,6 +1108,58 @@ fn main() {
     let result = match args.get(1).map(String::as_str) {
         Some("managed-service") if args.get(2).map(String::as_str) == Some("serve") => {
             managed_service::serve()
+        }
+        Some("managed-service") if args.get(2).map(String::as_str) == Some("serve-uds") => {
+            #[cfg(unix)]
+            {
+                managed_service::serve_uds()
+            }
+            #[cfg(not(unix))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "SCM_CREDENTIALS UDS service requires Unix",
+                ))
+            }
+        }
+        Some("managed-service") if args.get(2).map(String::as_str) == Some("demo") => {
+            #[cfg(unix)]
+            {
+                let grace = args
+                    .iter()
+                    .position(|arg| arg == "--grace-secs")
+                    .and_then(|index| args.get(index + 1))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(2)
+                    .clamp(1, 10);
+                managed_service::run_demo(grace)
+            }
+            #[cfg(not(unix))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the credentialed lab demo requires Unix sockets",
+                ))
+            }
+        }
+        Some("managed-service") if args.get(2).map(String::as_str) == Some("client-agent") => {
+            #[cfg(unix)]
+            {
+                match args.get(3) {
+                    Some(path) => managed_service::client_agent(std::path::Path::new(path)),
+                    None => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing UDS path",
+                    )),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Unix sockets unavailable",
+                ))
+            }
         }
         Some("lab") => cmd_lab(),
         Some("close") => {

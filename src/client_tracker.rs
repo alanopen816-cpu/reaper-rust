@@ -390,6 +390,22 @@ pub fn record_lab_client(
     }
     save_at(&registry, &registry_path())
 }
+
+/// Check that a kernel-authenticated peer matches the exact lab roster identity.
+pub fn is_lab_client_registered(pid: u32, start_ticks: u64, server: &str, nonce: &str) -> bool {
+    let Ok(registry) = current_registry() else {
+        return false;
+    };
+    let boot_id = boot_id().ok();
+    registry.clients.iter().any(|record| {
+        record.identity.pid == pid
+            && record.identity.start_ticks == start_ticks
+            && record.identity.server == server
+            && record.identity.nonce == nonce
+            && boot_id.as_deref() == Some(record.identity.boot_id.as_str())
+            && process_start_ticks(pid).ok() == Some(start_ticks)
+    })
+}
 pub fn current_registry() -> io::Result<Registry> {
     load_at(&registry_path())
 }
