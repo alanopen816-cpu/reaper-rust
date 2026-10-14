@@ -8,8 +8,87 @@
 //! its symbol availability is documented in README/limitations, and no code
 //! path in this phase may send a signal.
 
+use crate::owner::OwnerVerdict;
 use crate::procfs::Process;
+use crate::relations::Relations;
 use std::fs;
+
+/// General process role. A role is descriptive evidence, never authority to act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum ProcessClass {
+    PersistentService,
+    Interactive,
+    Build,
+    Auxiliary,
+    DevTool,
+    LocalServer,
+    Watchdog,
+    Independent,
+    Unknown,
+    Critical,
+}
+
+#[derive(Clone)]
+pub struct ClassificationEvidence<'a> {
+    pub process: &'a Process,
+    pub identity: &'a ProcessIdentity,
+    pub relations: &'a Relations,
+    pub owner: &'a OwnerVerdict,
+    pub client_or_work_active: Option<bool>,
+}
+
+/// Classifier adapters extend general classification; priority order is registration order.
+#[allow(dead_code)]
+pub trait Classifier {
+    fn classify(&self, evidence: &ClassificationEvidence<'_>) -> Option<ProcessClass>;
+}
+
+#[allow(dead_code)]
+pub fn classify(e: &ClassificationEvidence<'_>, extensions: &[&dyn Classifier]) -> ProcessClass {
+    for extension in extensions {
+        if let Some(class) = extension.classify(e) {
+            return class;
+        }
+    }
+    let p = e.process;
+    if p.pid != e.identity.pid || p.start_ticks != e.identity.start_ticks || p.uid != e.identity.uid
+    {
+        return ProcessClass::Unknown;
+    }
+    if p.uid.is_none() || p.command.is_empty() {
+        return ProcessClass::Unknown;
+    }
+    if matches!(e.owner, OwnerVerdict::ClaimedActive { .. }) {
+        return ProcessClass::PersistentService;
+    }
+    let node = e.relations.nodes.get(&p.pid);
+    if matches!(e.owner, OwnerVerdict::ClaimedDown { .. }) {
+        return ProcessClass::PersistentService;
+    }
+    if node.is_some_and(|n| n.parent_missing) {
+        return ProcessClass::Unknown;
+    }
+    if node.is_some()
+        && e.relations
+            .watchdogs
+            .iter()
+            .any(|w| w.pid == p.pid && w.evidence == crate::relations::Evidence::Verified)
+    {
+        return ProcessClass::Watchdog;
+    }
+    if p.pid == p.session && p.ppid != 1 && p.ppid != p.pid {
+        return ProcessClass::Interactive;
+    }
+    if e.client_or_work_active.is_none() {
+        return ProcessClass::Unknown;
+    }
+    // Names are intentionally not used to promote any class.
+    if e.client_or_work_active == Some(true) {
+        return ProcessClass::DevTool;
+    }
+    ProcessClass::Independent
+}
 
 /// Stable identity of one process observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +196,90 @@ mod tests {
             swap_kib: 0,
             uid,
         }
+    }
+
+    fn empty_rel() -> crate::relations::Relations {
+        crate::relations::build(&[])
+    }
+    fn evidence<'a>(
+        p: &'a Process,
+        id: &'a ProcessIdentity,
+        rel: &'a crate::relations::Relations,
+        owner: &'a crate::owner::OwnerVerdict,
+        active: Option<bool>,
+    ) -> ClassificationEvidence<'a> {
+        ClassificationEvidence {
+            process: p,
+            identity: id,
+            relations: rel,
+            owner,
+            client_or_work_active: active,
+        }
+    }
+    struct Custom;
+    impl Classifier for Custom {
+        fn classify(&self, _: &ClassificationEvidence<'_>) -> Option<ProcessClass> {
+            Some(ProcessClass::Critical)
+        }
+    }
+
+    #[test]
+    fn unknown_protected_and_orphan_not_abandoned() {
+        let p = proc(52, 100, Some(10373));
+        let id = identify(&p, None);
+        let rel = crate::relations::build(std::slice::from_ref(&p));
+        let owner = crate::owner::OwnerVerdict::Unclaimed;
+        let e = evidence(&p, &id, &rel, &owner, None);
+        assert_eq!(classify(&e, &[]), ProcessClass::Unknown);
+        assert!(crate::evidence::proven(&crate::evidence::AbandonEvidence {
+            lab_member: true,
+            owner: owner.clone(),
+            grace_expired: true,
+            revalidated_now: true,
+            owner_dead: Some(true),
+            last_client_gone: Some(true),
+            no_pending_work: Some(true),
+        }));
+        assert_eq!(classify(&e, &[]), ProcessClass::Unknown);
+        assert!(rel.nodes[&52].parent_missing);
+    }
+
+    #[test]
+    fn custom_classifier_extension_registers_class() {
+        let p = proc(53, 100, Some(10373));
+        let id = identify(&p, None);
+        let rel = empty_rel();
+        let owner = crate::owner::OwnerVerdict::Unclaimed;
+        let custom = Custom;
+        assert_eq!(
+            classify(&evidence(&p, &id, &rel, &owner, None), &[&custom]),
+            ProcessClass::Critical
+        );
+        let protected = crate::protection::apply_classification(
+            crate::protection::Protection {
+                tier: crate::protection::Tier::Known,
+                reason: "ordinary".into(),
+            },
+            classify(&evidence(&p, &id, &rel, &owner, None), &[&custom]),
+            false,
+        );
+        assert_eq!(protected.tier, crate::protection::Tier::Contextual);
+    }
+
+    #[test]
+    fn service_name_spoof_does_not_promote_process() {
+        let p = Process {
+            name: "runsv".into(),
+            command: "/tmp/runsv".into(),
+            ..proc(54, 100, Some(10373))
+        };
+        let id = identify(&p, None);
+        let rel = empty_rel();
+        let owner = crate::owner::OwnerVerdict::Unclaimed;
+        assert_eq!(
+            classify(&evidence(&p, &id, &rel, &owner, Some(false)), &[]),
+            ProcessClass::Independent
+        );
     }
 
     #[test]

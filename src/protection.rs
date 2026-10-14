@@ -26,6 +26,27 @@ pub struct Protection {
     pub reason: String,
 }
 
+/// Apply a classification result monotonically: only proven-inactive independent
+/// processes retain ordinary evidence-based policy eligibility.
+#[allow(dead_code)]
+pub fn apply_classification(
+    mut protection: Protection,
+    class: crate::identity::ProcessClass,
+    positively_verified_inactive: bool,
+) -> Protection {
+    if class == crate::identity::ProcessClass::Unknown {
+        protection.tier = Tier::Unknown;
+        protection.reason = "classification unknown; protected by default".into();
+    } else if !(class == crate::identity::ProcessClass::Independent && positively_verified_inactive)
+    {
+        if protection.tier == Tier::Known {
+            protection.tier = Tier::Contextual;
+        }
+        protection.reason = format!("classified {class:?}; protected by default");
+    }
+    protection
+}
+
 fn name_of(p: &Process) -> String {
     p.name.to_ascii_lowercase()
 }
@@ -194,5 +215,57 @@ mod tests {
         let p = proc(70, 1, "mystery", None);
         let r = protect(&p, 999, &empty_rel(), Some(10373));
         assert_eq!(r.tier, Tier::Unknown);
+    }
+
+    #[test]
+    fn classified_persistent_service_is_protected() {
+        let result = apply_classification(
+            Protection {
+                tier: Tier::Known,
+                reason: "ordinary".into(),
+            },
+            crate::identity::ProcessClass::PersistentService,
+            false,
+        );
+        assert_eq!(result.tier, Tier::Contextual);
+    }
+
+    #[test]
+    fn classified_unknown_is_protected() {
+        let result = apply_classification(
+            Protection {
+                tier: Tier::Known,
+                reason: "ordinary".into(),
+            },
+            crate::identity::ProcessClass::Unknown,
+            true,
+        );
+        assert_eq!(result.tier, Tier::Unknown);
+    }
+
+    #[test]
+    fn verified_inactive_independent_remains_policy_eligible() {
+        let result = apply_classification(
+            Protection {
+                tier: Tier::Known,
+                reason: "ordinary".into(),
+            },
+            crate::identity::ProcessClass::Independent,
+            true,
+        );
+        assert_eq!(result.tier, Tier::Known);
+    }
+
+    #[test]
+    fn active_independent_is_protected_by_classifier() {
+        let result = apply_classification(
+            Protection {
+                tier: Tier::Known,
+                reason: "ordinary".into(),
+            },
+            crate::identity::ProcessClass::Independent,
+            false,
+        );
+        assert_eq!(result.tier, Tier::Contextual);
     }
 }
