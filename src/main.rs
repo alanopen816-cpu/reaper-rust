@@ -15,6 +15,7 @@ mod identity;
 mod lab;
 mod lab_coverage;
 mod logx;
+mod managed_service;
 mod owner;
 mod pidfd;
 mod pilot;
@@ -1035,6 +1036,9 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let state_dir = logx::default_state_dir();
     let result = match args.get(1).map(String::as_str) {
+        Some("managed-service") if args.get(2).map(String::as_str) == Some("serve") => {
+            managed_service::serve()
+        }
         Some("lab") => cmd_lab(),
         Some("close") => {
             let pid = args

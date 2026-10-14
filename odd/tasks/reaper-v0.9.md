@@ -50,6 +50,8 @@ Make Reaper a daily Termux operator: autonomously manage one REAL lab-owned serv
 - 2026-10-14: feature doc created (8 tasks V9-T1..T8); branch `feature/reaper-v0.9` created from `feature/reaper-v0.8@cb436cc`; Git linear decided.
 - 2026-10-14: V9-T1 in flight (explorer ses_ec522b094ffeL3tjdzzSBLzfT8) + parent baseline: `cargo test` 143+1+2+2 green on the fresh branch. V9-T2 launches on audit GO.
 - 2026-10-14: V9-T1 audit NO-GO (explorer) with 3 bounded items → worker (cmdline compare + poison matrix, ses_ec52151e6ffelNQc7gNFwV48KX) + verifier trace (ses_ec5213aceffeBlvVA8yYHFlTE0) in parallel. Tracer result: STALE-CARRIED none (ignore-carried design confirmed); cmd_close unsatisfiable confirmed (fail-closed); 3 UNTRACED remain (reconnect-cancel, work-appears-cancel, isolated stale-owner) — stale-owner covered by worker round in flight; other 2 go to a micro-round next.
+- 2026-10-14: V9-T1 CLOSED (cmdline fix banked 1b236ab; tracer STALE-CARRIED none). Poison matrix DROPPED as incoherent — worker proved the gate takes no carried channel, so carried-poison tests are untestable without inventing the vulnerability; ignore-carried holds structurally. 2 UNTRACED (reconnect-cancel, work-appears-cancel) transfer to V9-T2: the 18-step live demo IS their evidence (steps 12-14). Verdict: CONDITIONAL-GO → GO for lab-owned real-service work only.
+- 2026-10-14: V9-T2 round 1 banked uncommitted (parent spot-checks: fmt pass, handshake test green; worker-reported 143+5/160+5 green, genuine RED) — real loopback child + `managed-service serve` route + PING/SHUTDOWN test. Missing: ledger, tracking, observer wiring, 18-step cycle, full-grace run.
 
 ## Verification evidence
 - (append per task: command → observed result, tier/outcome, commit id)
