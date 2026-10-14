@@ -30,6 +30,7 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     Processes,
+    Operations,
     Logs,
     Clients,
     Evidence,
@@ -53,6 +54,7 @@ enum Key {
     Logs,
     Clients,
     Evidence,
+    Operations,
     Help,
     Quit,
     Search,
@@ -128,6 +130,7 @@ impl UiState {
             Key::Logs => self.view = View::Logs,
             Key::Clients => self.view = View::Clients,
             Key::Evidence => self.view = View::Evidence,
+            Key::Operations => self.view = View::Operations,
             Key::Help => self.view = View::Help,
             Key::Quit => self.quit = true,
             _ => {}
@@ -555,11 +558,30 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                 );
             }
         }
+        View::Operations => lines.extend(
+            [
+                format!("supervisor: {}", snap.supervisor),
+                "pilot unavailable (pid/heartbeat absent); observed time unavailable".into(),
+                format!(
+                    "active processes={} (procfs); candidates unavailable (motor decisions absent)",
+                    snap.rows.len()
+                ),
+                "grace unavailable (timer absent); protected list in process view".into(),
+                "block reasons in inspector; client coverage unavailable (registry only)".into(),
+                format!(
+                    "decision history unavailable; interruption evidence={} log entries",
+                    snap.events.len()
+                ),
+                "resources below; supervisor RSS unavailable".into(),
+            ]
+            .into_iter()
+            .map(Line::from),
+        ),
         View::Help => lines.extend(
             [
                 "↑/↓ select  / search  Enter detail",
                 "t tree/list  s sort CPU/RSS/swap/name",
-                "l events  c clients  e evidence  ? help",
+                "l events  c clients  e evidence  o ops  ? help",
                 "r refresh  q quit (read-only; no destructive keys)",
             ]
             .into_iter()
@@ -685,6 +707,8 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                     Line::from(format!("protection={:?}: {}", row.tier, row.reason)),
                     Line::from(format!("protected because: {}", row.reason)),
                         Line::from(format!("decision={}", row.decision)),
+                        Line::from("motor candidacy unavailable: snapshot has no motor decision"),
+                        Line::from("identity/clients/work/coverage/grace/policy candidacy blocks are not available"),
                         Line::from(format!("owner verdict={:?}", row.owner)),
                         Line::from(format!("client registry={}", row.client_state)),
                     Line::from("full client/work evidence: `reaper pilot report`"),
@@ -715,6 +739,7 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                         View::Logs => "Recent events",
                         View::Clients => "Managed clients",
                         View::Evidence => "Evidence and block reasons",
+                        View::Operations => "Operations (read-only)",
                         View::Help => "Key help",
                         _ => "Processes",
                     }),
@@ -759,6 +784,7 @@ fn key_event(key: crossterm::event::KeyEvent) -> Key {
         KeyCode::Char('l') => Key::Logs,
         KeyCode::Char('c') => Key::Clients,
         KeyCode::Char('e') => Key::Evidence,
+        KeyCode::Char('o') => Key::Operations,
         KeyCode::Char('?') => Key::Help,
         KeyCode::Char('q') => Key::Quit,
         KeyCode::Char('/') => Key::Search,
@@ -1005,6 +1031,37 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("candidate=unavailable"));
         assert!(text.contains("grace=unavailable"));
+    }
+
+    #[test]
+    fn operations_view_reports_snapshot_gaps_and_read_only_bindings() {
+        let mut state = UiState::default();
+        state.handle(Key::Operations, 0);
+        assert_eq!(state.view, View::Operations);
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state, &fixture())).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("candidates unavailable"));
+        assert!(text.contains("pilot unavailable"));
+        let before = state.clone();
+        for key in [
+            Key::Operations,
+            Key::Logs,
+            Key::Clients,
+            Key::Evidence,
+            Key::Help,
+        ] {
+            state.handle(key, 0);
+        }
+        assert!(!state.quit);
+        assert_eq!(before.view, View::Operations);
     }
 
     #[test]
