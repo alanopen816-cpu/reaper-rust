@@ -751,7 +751,7 @@ fn main() {
             }
         }
         Some("pilot") => match args.get(2).map(String::as_str) {
-            Some("report") => pilot::report(),
+            Some("report") => pilot::report_mode(args.iter().any(|a| a == "--deep")),
             Some("metrics") => pilot::metrics(&PathBuf::from(&state_dir)),
             Some("start") => {
                 let interval = args

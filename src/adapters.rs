@@ -173,6 +173,10 @@ impl OpenCodeProbe {
         }
     }
 
+    pub fn assess_deep(&self) -> ClientWorkState {
+        self.assess()
+    }
+
     fn server_info(&self) -> Result<(String, u32), String> {
         let body = self.call("server.info")?;
         #[cfg(test)]
@@ -571,7 +575,11 @@ pub struct CodexProbe {
 }
 
 impl CodexProbe {
+    pub fn assess_deep(&self) -> ClientWorkState {
+        self.assess()
+    }
     pub fn assess(&self) -> ClientWorkState {
+        crate::queries::count_auxiliary_spawn();
         let output = std::process::Command::new("codex")
             .args(["app-server", "daemon", "version"])
             .output();

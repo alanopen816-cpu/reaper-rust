@@ -54,6 +54,7 @@ pub fn codex_db_counts(codex_home: &str) -> Result<(i64, i64, i64), String> {
 }
 
 fn sqlite_count(path: &str, sql: &str) -> Result<i64, String> {
+    AUX_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uri = format!("file:{path}?mode=ro");
     let mut child = Command::new("sqlite3")
         .arg("-readonly")
@@ -89,6 +90,14 @@ fn sqlite_count(path: &str, sql: &str) -> Result<i64, String> {
             }
         }
     }
+}
+
+static AUX_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub fn auxiliary_spawn_count() -> usize {
+    AUX_SPAWNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn count_auxiliary_spawn() {
+    AUX_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The app-server proxy forwarded Content-Length bytes verbatim, but the isolated daemon
@@ -175,13 +184,14 @@ fn add_endpoint<'a>(
 }
 
 fn run_opencode_command(command: &mut Command, timeout: Duration) -> Result<String, String> {
+    AUX_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start opencode api: {e}"))?;
     let started = Instant::now();
-    loop {
+    while started.elapsed() < timeout {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let output = child.wait_with_output().map_err(|e| e.to_string())?;
@@ -197,15 +207,13 @@ fn run_opencode_command(command: &mut Command, timeout: Duration) -> Result<Stri
                 return String::from_utf8(output.stdout)
                     .map_err(|e| format!("invalid UTF-8 response: {e}"));
             }
-            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(20)),
-            Ok(None) | Err(_) => {
-                // Reaper-owned query child; the sole permitted SIGKILL use.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("OpenCode query timed out or could not be polled".into());
-            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("OpenCode query timed out or could not be polled".into())
 }
 
 pub fn http_get(base_url: &str, password: &str, path: &str) -> Result<String, String> {
@@ -267,6 +275,7 @@ fn validate_loopback(url: &str) -> Result<(), String> {
 }
 
 fn run_curl(command: &mut Command, config: &[u8]) -> Result<String, String> {
+    AUX_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -294,10 +303,10 @@ fn run_curl(command: &mut Command, config: &[u8]) -> Result<String, String> {
                     .map_err(|_| "explicit probe failed".into());
             }
             Ok(None) if start.elapsed() < QUERY_TIMEOUT => thread::sleep(Duration::from_millis(10)),
-            _ => {
+            Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("explicit probe failed".into());
+                return Err("explicit probe timed out or polling failed".into());
             }
         }
     }

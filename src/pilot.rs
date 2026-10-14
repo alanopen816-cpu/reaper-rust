@@ -24,111 +24,171 @@ pub struct Candidate {
     pub limitations: Vec<String>,
 }
 
-pub fn candidates() -> (Vec<Candidate>, usize) {
-    // One full bounded ambient probe per report call, not one per process.
-    let opencode_state = std::panic::catch_unwind(|| {
-        crate::adapters::OpenCodeProbe {
-            base_url: None,
-            password: None,
-        }
-        .assess()
-    })
-    .unwrap_or_else(|_| evidence::ClientWorkState::Unknown {
-        missing: vec!["OpenCode probe panicked".into()],
-    });
-    // Reporting only: Codex WorkAbsent preserves last_client_gone=None because socket-client
-    // enumeration is unavailable; the engine's conjunctive proof inputs are intentionally untouched.
-    let codex_state =
-        std::panic::catch_unwind(|| crate::adapters::CodexProbe { sock_path: None }.assess())
-            .unwrap_or_else(|_| evidence::ClientWorkState::Unknown {
-                missing: vec!["Codex probe panicked".into()],
-            });
-    let outcome = procfs::scan();
-    let rel = relations::build(&outcome.processes);
-    let uid = crate::own_uid();
-    let claims = owner::claims_map(&owner::default_svdir());
-    let rows = outcome
-        .processes
-        .iter()
-        .map(|p| {
-            let prot = protect(p, std::process::id(), &rel, uid);
-            let adapter = crate::adapter_for(&p.name, &p.command);
-            let id = identity::identify(p, identity::read_boot_id());
-            let live = adapter.liveness(&id);
-            let client_work =
-                (adapter.name() == "opencode").then(|| format!("client_work={opencode_state:?}"));
-            let codex_work =
-                (adapter.name() == "codex").then(|| format!("client_work={codex_state:?}"));
-            let owner = owner::resolve(&claims, p);
-            let lab_member = crate::lab::current_registry()
-                .unwrap_or_default()
-                .iter()
-                .any(|e| e.pid == p.pid && e.start_ticks == p.start_ticks);
-            let signals = Signals {
-                owner_reports_active: match (owner.clone(), live) {
-                    (owner::OwnerVerdict::ClaimedActive { .. }, _) | (_, Liveness::Alive) => {
-                        Some(true)
-                    }
-                    (owner::OwnerVerdict::ClaimedDown { .. }, _) | (_, Liveness::Dead) => {
-                        Some(false)
-                    }
-                    _ => None,
-                },
-                proven_abandoned: false,
-                needs_tolerance: false,
-                memory_pressure: false,
-            };
-            let decision = policy::decide(&Policy::default(), &prot, p, &signals);
-            let mut evidence = vec![
-                format!("owner={owner:?}"),
-                format!("adapter={} liveness={live:?}", adapter.detail()),
-                format!("lab_registry_member={lab_member}"),
-                format!(
-                    "proven_abandoned={}",
-                    evidence::proven(&evidence::AbandonEvidence {
-                        lab_member,
-                        owner,
-                        grace_expired: false,
-                        revalidated_now: false,
-                        owner_dead: None,
-                        last_client_gone: None,
-                        no_pending_work: None
-                    })
-                ),
-            ];
-            if let Some(client_work) = client_work {
-                evidence.push(client_work);
-            }
-            if let Some(codex_work) = codex_work {
-                evidence.push(codex_work);
-            }
-            let managed_clients = crate::client_tracker::current_registry()
-                .map(|r| r.clients.len())
-                .unwrap_or(0);
-            let coverage = if crate::client_tracker::coverage_complete() {
-                "full"
-            } else {
-                "managed-only"
-            };
-            let limitations = vec![
-                "dry-run only; no close action is available".into(),
-                "client and pending-work absence may be unverifiable".into(),
-                format!("managed_clients={managed_clients}; coverage={coverage}"),
-            ];
-            Candidate {
-                pid: p.pid,
-                tier: prot.tier,
-                decision: format!("{decision:?}"),
-                evidence,
-                limitations,
-            }
-        })
-        .collect();
-    (rows, outcome.skipped_stat + outcome.skipped_mismatch)
+#[derive(Debug, Default)]
+struct StageMetric {
+    ms: u128,
+    ops: usize,
+    errors: usize,
+    timeouts: usize,
 }
 
-pub fn report() -> io::Result<()> {
-    let (rows, skipped) = candidates();
+impl StageMetric {
+    fn run<T>(f: impl FnOnce() -> T) -> (T, Self) {
+        let start = Instant::now();
+        let value = f();
+        (
+            value,
+            Self {
+                ms: start.elapsed().as_millis(),
+                ops: 1,
+                ..Self::default()
+            },
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct InspectionMetrics {
+    proc_scan: StageMetric,
+    classify: StageMetric,
+    relations: StageMetric,
+    client_reads: StageMetric,
+    report_render: StageMetric,
+    opencode: StageMetric,
+    codex: StageMetric,
+    adapter_queries: StageMetric,
+    persist: StageMetric,
+    logs: StageMetric,
+    aux_spawns: usize,
+}
+
+#[cfg(test)]
+pub fn candidates() -> (Vec<Candidate>, usize) {
+    let (rows, skipped, _) = candidates_with_metrics();
+    (rows, skipped)
+}
+
+fn candidates_with_metrics() -> (Vec<Candidate>, usize, InspectionMetrics) {
+    let mut metrics = InspectionMetrics::default();
+    let spawn_start = crate::queries::auxiliary_spawn_count();
+    // Reports use the same bounded fast snapshot as the supervisor; slow adapters are deferred.
+    let (outcome, proc_scan) = StageMetric::run(procfs::scan);
+    metrics.proc_scan = proc_scan;
+    let (rel, relations) = StageMetric::run(|| relations::build(&outcome.processes));
+    metrics.relations = relations;
+    let uid = crate::own_uid();
+    let claims = owner::claims_map(&owner::default_svdir());
+    let lab_registry = crate::lab::current_registry();
+    let client_registry = crate::client_tracker::current_registry();
+    metrics.client_reads = StageMetric {
+        ops: 2,
+        errors: usize::from(lab_registry.is_err()) + usize::from(client_registry.is_err()),
+        ..StageMetric::default()
+    };
+    let lab_registry = lab_registry.unwrap_or_default();
+    let managed_clients = client_registry.as_ref().map(|r| r.clients.len());
+    let opencode_state = evidence::ClientWorkState::Unknown {
+        missing: vec!["deep inspection deferred in fast scan".into()],
+    };
+    let codex_state = opencode_state.clone();
+    let (rows, classify_metric) = StageMetric::run(|| {
+        outcome
+            .processes
+            .iter()
+            .map(|p| {
+                let prot = protect(p, std::process::id(), &rel, uid);
+                let adapter = crate::adapter_for(&p.name, &p.command);
+                let id = identity::identify(p, identity::read_boot_id());
+                let live = adapter.liveness(&id);
+                let client_work = (adapter.name() == "opencode")
+                    .then(|| format!("client_work={opencode_state:?}"));
+                let codex_work =
+                    (adapter.name() == "codex").then(|| format!("client_work={codex_state:?}"));
+                let owner = owner::resolve(&claims, p);
+                let lab_member = lab_registry
+                    .iter()
+                    .any(|e| e.pid == p.pid && e.start_ticks == p.start_ticks);
+                let signals = Signals {
+                    owner_reports_active: match (owner.clone(), live) {
+                        (owner::OwnerVerdict::ClaimedActive { .. }, _) | (_, Liveness::Alive) => {
+                            Some(true)
+                        }
+                        (owner::OwnerVerdict::ClaimedDown { .. }, _) | (_, Liveness::Dead) => {
+                            Some(false)
+                        }
+                        _ => None,
+                    },
+                    proven_abandoned: false,
+                    needs_tolerance: false,
+                    memory_pressure: false,
+                };
+                let decision = policy::decide(&Policy::default(), &prot, p, &signals);
+                let mut evidence = vec![
+                    format!("owner={owner:?}"),
+                    format!("adapter={} liveness={live:?}", adapter.detail()),
+                    format!("lab_registry_member={lab_member}"),
+                    format!(
+                        "proven_abandoned={}",
+                        evidence::proven(&evidence::AbandonEvidence {
+                            lab_member,
+                            owner,
+                            grace_expired: false,
+                            revalidated_now: false,
+                            owner_dead: None,
+                            last_client_gone: None,
+                            no_pending_work: None
+                        })
+                    ),
+                ];
+                if let Some(client_work) = client_work {
+                    evidence.push(client_work);
+                }
+                if let Some(codex_work) = codex_work {
+                    evidence.push(codex_work);
+                }
+                let managed_clients = managed_clients.unwrap_or(0);
+                let coverage = if crate::client_tracker::coverage_complete() {
+                    "full"
+                } else {
+                    "managed-only"
+                };
+                let limitations = vec![
+                    "dry-run only; no close action is available".into(),
+                    "client and pending-work absence may be unverifiable".into(),
+                    format!("managed_clients={managed_clients}; coverage={coverage}"),
+                ];
+                Candidate {
+                    pid: p.pid,
+                    tier: prot.tier,
+                    decision: format!("{decision:?}"),
+                    evidence,
+                    limitations,
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    metrics.classify = StageMetric {
+        ops: outcome.processes.len(),
+        ..classify_metric
+    };
+    metrics.report_render = StageMetric {
+        ops: rows.len(),
+        ..StageMetric::default()
+    };
+    metrics.aux_spawns = crate::queries::auxiliary_spawn_count().saturating_sub(spawn_start);
+    (
+        rows,
+        outcome.skipped_stat + outcome.skipped_mismatch,
+        metrics,
+    )
+}
+
+pub fn report_mode(deep: bool) -> io::Result<()> {
+    let (mut rows, skipped, mut metrics) = candidates_with_metrics();
+    if deep {
+        deep_inspect(&mut rows, &mut metrics);
+    }
+    let render_start = Instant::now();
     println!("PID     TIER        DECISION | EVIDENCE | LIMITATIONS");
     for row in rows {
         println!(
@@ -141,7 +201,96 @@ pub fn report() -> io::Result<()> {
         );
     }
     println!("skipped={skipped}; READ ONLY — dry-run; no signals sent");
+    metrics.report_render.ms = render_start.elapsed().as_millis();
+    println!("inspection_metrics={{\"proc_scan_ms\":{},\"classify_ms\":{},\"relations_ms\":{},\"adapter_queries_ms\":{},\"opencode_queries_ms\":{},\"codex_queries_ms\":{},\"client_reads_ms\":{},\"persist_ms\":{},\"report_render_ms\":{},\"logs_ms\":{},\"aux_spawns\":{},\"errors\":{},\"timeouts\":{}}}", metrics.proc_scan.ms, metrics.classify.ms, metrics.relations.ms, metrics.adapter_queries.ms, metrics.opencode.ms, metrics.codex.ms, metrics.client_reads.ms, metrics.persist.ms, metrics.report_render.ms, metrics.logs.ms, metrics.aux_spawns, metrics.proc_scan.errors + metrics.classify.errors + metrics.relations.errors + metrics.client_reads.errors + metrics.opencode.errors + metrics.codex.errors, metrics.opencode.timeouts + metrics.codex.timeouts);
     Ok(())
+}
+
+const DEEP_TIMEOUT: Duration = Duration::from_secs(35);
+const MAX_DEEP_WORKERS: usize = 2;
+fn deep_inspect(rows: &mut [Candidate], metrics: &mut InspectionMetrics) {
+    let started = Instant::now();
+    let processes = procfs::scan().processes;
+    let targets: Vec<_> = rows
+        .iter()
+        .filter_map(|r| {
+            processes.iter().find(|p| p.pid == r.pid).and_then(|p| {
+                let name = crate::adapter_for(&p.name, &p.command).name();
+                (name == "opencode" || name == "codex").then_some((r.pid, name.to_owned()))
+            })
+        })
+        .collect();
+    for batch in targets.chunks(MAX_DEEP_WORKERS) {
+        if started.elapsed() >= DEEP_TIMEOUT {
+            for (pid, name) in batch {
+                mark_unknown(rows, *pid, format!("{name} inspection timeout"));
+            }
+            metrics.opencode.timeouts += batch.iter().filter(|(_, n)| n == "opencode").count();
+            metrics.codex.timeouts += batch.iter().filter(|(_, n)| n == "codex").count();
+            continue;
+        }
+        let batch_started = Instant::now();
+        let handles: Vec<_> = batch
+            .iter()
+            .map(|(pid, name)| {
+                let (pid, name) = (*pid, name.clone());
+                thread::spawn(move || {
+                    let state = if name == "opencode" {
+                        crate::adapters::OpenCodeProbe {
+                            base_url: None,
+                            password: None,
+                        }
+                        .assess_deep()
+                    } else {
+                        crate::adapters::CodexProbe { sock_path: None }.assess_deep()
+                    };
+                    (pid, name, state)
+                })
+            })
+            .collect();
+        for ((pid, name), handle) in batch.iter().zip(handles) {
+            if batch_started.elapsed() >= DEEP_TIMEOUT {
+                mark_unknown(rows, *pid, format!("{name} inspection timeout"));
+                if name == "opencode" {
+                    metrics.opencode.timeouts += 1;
+                } else {
+                    metrics.codex.timeouts += 1;
+                }
+                drop(handle);
+                continue;
+            }
+            if let Ok((pid, name, state)) = handle.join() {
+                let metric = if name == "opencode" {
+                    &mut metrics.opencode
+                } else {
+                    &mut metrics.codex
+                };
+                metric.ops += 1;
+                if matches!(
+                    state,
+                    evidence::ClientWorkState::Error { .. }
+                        | evidence::ClientWorkState::Unknown { .. }
+                ) {
+                    metric.errors += 1;
+                }
+                mark_state(rows, pid, format!("client_work={state:?}"));
+            }
+        }
+    }
+    metrics.adapter_queries.ms = started.elapsed().as_millis();
+}
+fn mark_unknown(rows: &mut [Candidate], pid: u32, note: String) {
+    mark_state(
+        rows,
+        pid,
+        format!("client_work=Unknown {{ missing: [{note}] }}"),
+    );
+}
+fn mark_state(rows: &mut [Candidate], pid: u32, state: String) {
+    if let Some(row) = rows.iter_mut().find(|r| r.pid == pid) {
+        row.evidence.retain(|e| !e.starts_with("client_work="));
+        row.evidence.push(state);
+    }
 }
 
 pub fn metrics(state_dir: &Path) -> io::Result<()> {
@@ -362,11 +511,53 @@ mod tests {
             .all(|r| r.evidence.iter().any(|e| e == "proven_abandoned=false")));
     }
     #[test]
+    fn fast_inspection_defers_adapters_and_batches_client_reads() {
+        let (rows, _, metrics) = candidates_with_metrics();
+        assert_eq!(metrics.opencode.ops + metrics.codex.ops, 0);
+        assert_eq!(metrics.client_reads.ops, 2);
+        assert!(rows
+            .iter()
+            .filter(|r| r.evidence.iter().any(|e| e.contains("client_work=")))
+            .all(|r| r
+                .evidence
+                .iter()
+                .any(|e| e.contains("deep inspection deferred"))));
+        assert!(rows
+            .iter()
+            .all(|r| r.evidence.iter().any(|e| e == "proven_abandoned=false")));
+    }
+    #[test]
     fn metrics_reads_configured_temporary_logs() {
         let dir = std::env::temp_dir().join(format!("reaper-pilot-metrics-{}", std::process::id()));
         fs::create_dir_all(dir.join("logs")).unwrap();
         fs::write(dir.join("logs/a"), b"log").unwrap();
         assert_eq!(crate::queries::dir_size_bytes(&dir.join("logs")), 3);
         let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn inspection_failure_and_timeout_are_unknown_not_absent() {
+        let mut rows = vec![Candidate {
+            pid: 7,
+            tier: Tier::Unknown,
+            decision: "Blocked".into(),
+            evidence: vec![],
+            limitations: vec![],
+        }];
+        mark_unknown(&mut rows, 7, "adapter timeout".into());
+        assert!(rows[0].evidence[0].contains("Unknown"));
+        assert!(!rows[0].evidence[0].contains("WorkAbsent"));
+        assert!(!evidence::proven(&evidence::AbandonEvidence {
+            lab_member: true,
+            owner: owner::OwnerVerdict::Unclaimed,
+            grace_expired: true,
+            revalidated_now: true,
+            owner_dead: Some(true),
+            last_client_gone: None,
+            no_pending_work: None
+        }));
+    }
+    #[test]
+    fn bounded_deep_worker_count_is_fixed() {
+        assert_eq!(MAX_DEEP_WORKERS, 2);
     }
 }
