@@ -387,6 +387,58 @@ fn pidfile(state_dir: &Path) -> std::path::PathBuf {
     state_dir.join("pilot.pid")
 }
 
+pub struct ObserverLock(std::path::PathBuf);
+
+impl Drop for ObserverLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Own an identity-checked observer pidfile. A live or malformed holder is
+/// never overwritten; only a record whose PID is demonstrably gone is stale.
+pub fn observer_lock(state_dir: &Path) -> io::Result<ObserverLock> {
+    fs::create_dir_all(state_dir)?;
+    let path = state_dir.join("observer.pid");
+    for _ in 0..2 {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                let start_ticks = process_start_ticks(std::process::id())?;
+                writeln!(
+                    file,
+                    "{{\"pid\":{},\"start_ticks\":{start_ticks}}}",
+                    std::process::id()
+                )?;
+                file.sync_all()?;
+                return Ok(ObserverLock(path));
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let stale = read_record(&path).is_ok_and(|r| process_start_ticks(r.pid).is_err());
+                if !stale {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "observer already running or pidfile is unverifiable",
+                    ));
+                }
+                fs::remove_file(&path)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "observer pidfile race",
+    ))
+}
+
 fn process_start_ticks(pid: u32) -> io::Result<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let end = stat
@@ -575,6 +627,16 @@ pub fn stop(state_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observer_singleton_lock_refuses_a_second_live_observer() {
+        let dir = std::env::temp_dir().join(format!("reaper-observer-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let first = observer_lock(&dir).expect("first observer owns lock");
+        assert!(observer_lock(&dir).is_err());
+        drop(first);
+        assert!(observer_lock(&dir).is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
     #[test]
     fn report_rows_are_limited_and_never_advance_abandonment() {
         let (rows, _) = candidates();

@@ -749,6 +749,7 @@ fn cmd_close(pid: u32, act: bool) -> io::Result<()> {
 }
 
 fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
+    let _observer_lock = pilot::observer_lock(state_dir)?;
     let log_cfg = logx::LogConfig::new(state_dir.join("logs"));
     let boot_id = identity::read_boot_id();
     let state_file = state_dir.join("supervisor.json");
