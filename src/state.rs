@@ -141,6 +141,23 @@ impl Supervisor {
         self.entries.get(&pid).map(|e| e.identity.clone())
     }
 
+    pub fn identity_snapshot(&self) -> Vec<(u32, ProcessIdentity)> {
+        self.entries
+            .iter()
+            .map(|(pid, entry)| (*pid, entry.identity.clone()))
+            .collect()
+    }
+
+    pub fn refresh_identity(&mut self, identity: &ProcessIdentity) {
+        if let Some(entry) = self.entries.get_mut(&identity.pid) {
+            if entry.identity.start_ticks == identity.start_ticks
+                && entry.identity.boot_id == identity.boot_id
+            {
+                entry.identity = identity.clone();
+            }
+        }
+    }
+
     /// Record a transition. Returns the record for logging.
     pub fn transition(
         &mut self,

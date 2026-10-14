@@ -212,6 +212,70 @@ pub fn report_mode(deep: bool) -> io::Result<()> {
 const DEEP_TIMEOUT: Duration = Duration::from_secs(35);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DEEP_WORKERS: usize = 2;
+
+#[derive(Default)]
+pub struct DeepScheduler {
+    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    scheduled: std::sync::atomic::AtomicUsize,
+}
+
+impl DeepScheduler {
+    pub fn schedule(&self, task: impl FnOnce() + Send + 'static) -> bool {
+        use std::sync::atomic::Ordering;
+        if self
+            .pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.scheduled.fetch_add(1, Ordering::Relaxed);
+        let pending = self.pending.clone();
+        std::thread::spawn(move || {
+            struct Reset(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _reset = Reset(pending);
+            task();
+        });
+        true
+    }
+
+    pub fn scheduled(&self) -> usize {
+        self.scheduled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn pending(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+pub fn schedule_deep_targets(
+    scheduler: &DeepScheduler,
+    targets: Vec<(u32, String)>,
+    budget: Duration,
+) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    scheduler.schedule(move || {
+        let mut rows = targets
+            .iter()
+            .map(|(pid, _)| Candidate {
+                pid: *pid,
+                tier: Tier::Unknown,
+                decision: "Unknown; deep evidence pending".into(),
+                evidence: vec!["client_work=Unknown { missing: [deep inspection pending] }".into()],
+                limitations: vec!["deep result is observational only".into()],
+            })
+            .collect::<Vec<_>>();
+        let mut metrics = InspectionMetrics::default();
+        deep_inspect_targets_with_budget(&mut rows, &mut metrics, budget, targets);
+    })
+}
 fn deep_inspect(rows: &mut [Candidate], metrics: &mut InspectionMetrics) {
     deep_inspect_with_budget(rows, metrics, DEEP_TIMEOUT);
 }
@@ -627,6 +691,25 @@ pub fn stop(state_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deep_scheduler_coalesces_pending_work_without_waiting() {
+        let scheduler = DeepScheduler::default();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        assert!(scheduler.schedule(move || {
+            let _ = release_rx.recv();
+        }));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(!scheduler.schedule(|| {}));
+        assert_eq!(scheduler.scheduled(), 1);
+        assert!(scheduler.pending());
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while scheduler.pending() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!scheduler.pending());
+    }
     #[test]
     fn observer_singleton_lock_refuses_a_second_live_observer() {
         let dir = std::env::temp_dir().join(format!("reaper-observer-lock-{}", std::process::id()));

@@ -134,6 +134,42 @@ fn decide_state(decision: &Decision, current: Option<State>) -> State {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DurableChange {
+    Appeared(identity::ProcessIdentity),
+    Changed(identity::ProcessIdentity, identity::ProcessIdentity),
+    Disappeared(identity::ProcessIdentity),
+}
+
+fn durable_identity_diff(
+    previous: &[(u32, identity::ProcessIdentity)],
+    current: &[(u32, identity::ProcessIdentity)],
+) -> Vec<DurableChange> {
+    let same_process = |a: &identity::ProcessIdentity, b: &identity::ProcessIdentity| {
+        a.pid == b.pid && a.start_ticks == b.start_ticks && a.boot_id == b.boot_id
+    };
+    let mut changes = Vec::new();
+    for (_, now) in current {
+        match previous.iter().find(|(_, old)| same_process(old, now)) {
+            None => changes.push(DurableChange::Appeared(now.clone())),
+            Some((_, old)) if old != now => {
+                changes.push(DurableChange::Changed(old.clone(), now.clone()));
+            }
+            Some(_) => {}
+        }
+    }
+    for (_, old) in previous {
+        if !current.iter().any(|(_, now)| same_process(old, now)) {
+            changes.push(DurableChange::Disappeared(old.clone()));
+        }
+    }
+    changes
+}
+
+fn same_process(a: &identity::ProcessIdentity, b: &identity::ProcessIdentity) -> bool {
+    a.pid == b.pid && a.start_ticks == b.start_ticks && a.boot_id == b.boot_id
+}
+
 /// The production classification-to-policy boundary, kept pure so cycle
 /// decisions can be exercised with deterministic process evidence.
 #[allow(clippy::too_many_arguments)]
@@ -295,6 +331,9 @@ struct Observer {
     log_cfg: logx::LogConfig,
     boot_id: Option<String>,
     usage_start: stats::SelfUsage,
+    deep_scheduler: pilot::DeepScheduler,
+    context_snapshot: HashMap<u32, (identity::ProcessIdentity, u32, u32)>,
+    owner_snapshot: HashMap<u32, (identity::ProcessIdentity, String)>,
 }
 
 impl Observer {
@@ -307,6 +346,84 @@ impl Observer {
         let self_pid = std::process::id();
         let uid = own_uid();
         let now = logx::now_secs();
+
+        let durable_before = self.supervisor.identity_snapshot();
+        let durable_now: Vec<_> = outcome
+            .processes
+            .iter()
+            .map(|p| (p.pid, identity::identify(p, self.boot_id.clone())))
+            .collect();
+        for change in durable_identity_diff(&durable_before, &durable_now) {
+            match change {
+                DurableChange::Appeared(id) => {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "state.appeared",
+                        &format!(
+                            "pid={} start={} boot={:?}",
+                            id.pid, id.start_ticks, id.boot_id
+                        ),
+                    )?;
+                }
+                DurableChange::Changed(old, new) => {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "state.identity_updated",
+                        &format!(
+                            "pid={} start={} exe={} -> {}",
+                            new.pid, new.start_ticks, old.exe, new.exe
+                        ),
+                    )?;
+                    self.supervisor.refresh_identity(&new);
+                }
+                DurableChange::Disappeared(id) => {
+                    if st.skipped > 0 {
+                        continue;
+                    }
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "state.disappeared",
+                        &format!(
+                            "pid={} start={} reason=identity absent from light snapshot",
+                            id.pid, id.start_ticks
+                        ),
+                    )?;
+                    self.supervisor.transition(
+                        &id,
+                        State::Exited,
+                        now,
+                        "event:disappeared",
+                        "lifecycle",
+                        "identity absent from light snapshot",
+                    );
+                    self.supervisor.retire(id.pid);
+                    st.transitions += 1;
+                }
+            }
+        }
+        for process in &outcome.processes {
+            let id = identity::identify(process, self.boot_id.clone());
+            if let Some((old_id, old_session, old_ppid)) = self.context_snapshot.get(&process.pid) {
+                if same_process(old_id, &id)
+                    && (*old_session != process.session || *old_ppid != process.ppid)
+                {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "process.context_changed",
+                        &format!(
+                            "pid={} session={} -> {} ppid={} -> {}",
+                            process.pid, old_session, process.session, old_ppid, process.ppid
+                        ),
+                    )?;
+                }
+            }
+            self.context_snapshot
+                .insert(process.pid, (id, process.session, process.ppid));
+        }
 
         for ev in self.tracker.diff(&outcome, &outcome.processes) {
             st.events += 1;
@@ -323,6 +440,11 @@ impl Observer {
                     )?;
                 }
                 Event::Disappeared { identity } => {
+                    if st.skipped > 0 {
+                        // Partial visibility is not evidence of disappearance;
+                        // the durable identity diff will retry on a clean scan.
+                        continue;
+                    }
                     st.log_bytes += logx::log(
                         &self.log_cfg,
                         logx::Level::Info,
@@ -386,6 +508,8 @@ impl Observer {
         // (pure file reads, no spawns, no signals).
         let claims = owner::claims_map(&owner::default_svdir());
 
+        let mut unknown_rows = 0usize;
+        let mut deep_targets = Vec::new();
         for p in &outcome.processes {
             let id = identity::identify(p, self.boot_id.clone());
             // Recycled PID under a live tracking key: prior state is void.
@@ -478,6 +602,19 @@ impl Observer {
                 }
                 owner::OwnerVerdict::Unclaimed => owner::OwnerVerdict::Unclaimed,
             };
+            let owner_fingerprint = format!("{owner_evidence:?}");
+            if let Some((old_id, old_owner)) = self.owner_snapshot.get(&p.pid) {
+                if same_process(old_id, &id) && old_owner != &owner_fingerprint {
+                    st.log_bytes += logx::log(
+                        &self.log_cfg,
+                        logx::Level::Info,
+                        "owner.changed",
+                        &format!("pid={} owner={} -> {}", p.pid, old_owner, owner_fingerprint),
+                    )?;
+                }
+            }
+            self.owner_snapshot
+                .insert(p.pid, (id.clone(), owner_fingerprint));
             let client_work = if adapter.name() == "opencode" {
                 adapters::OpenCodeProbe {
                     base_url: None,
@@ -528,7 +665,7 @@ impl Observer {
             };
             let classification_activity =
                 client_tracker::combine_signals(owner_active, work_activity);
-            let (_class, _prot, mut decision) = classified_decision(
+            let (class, _prot, mut decision) = classified_decision(
                 p,
                 &id,
                 &rel,
@@ -540,6 +677,13 @@ impl Observer {
                 &signals,
                 &[],
             );
+            if class == identity::ProcessClass::Unknown {
+                unknown_rows += 1;
+                let name = adapter.name();
+                if name == "opencode" || name == "codex" {
+                    deep_targets.push((p.pid, name.to_owned()));
+                }
+            }
             if current == Some(State::ReadyForRevalidation) {
                 decision = if evidence::proven(&ev)
                     && coverage == client_tracker::Coverage::CompleteVerified
@@ -627,6 +771,38 @@ impl Observer {
                     self.supervisor.arm_grace(p.pid, now + grace);
                 }
             }
+        }
+
+        if st.skipped == 0 {
+            let visible: std::collections::HashSet<_> = outcome
+                .processes
+                .iter()
+                .map(|process| process.pid)
+                .collect();
+            self.context_snapshot.retain(|pid, _| visible.contains(pid));
+            self.owner_snapshot.retain(|pid, _| visible.contains(pid));
+        }
+
+        if !outcome.processes.is_empty()
+            && unknown_rows.saturating_mul(2) >= outcome.processes.len()
+            && pilot::schedule_deep_targets(
+                &self.deep_scheduler,
+                deep_targets,
+                Duration::from_secs(35),
+            )
+        {
+            st.log_bytes += logx::log(
+                &self.log_cfg,
+                logx::Level::Info,
+                "deep.scheduled",
+                &format!(
+                    "unknown_rows={} total_rows={} scheduled_runs={} pending={} budget_secs=35 bounded_workers=2",
+                    unknown_rows,
+                    outcome.processes.len(),
+                    self.deep_scheduler.scheduled(),
+                    self.deep_scheduler.pending()
+                ),
+            )?;
         }
 
         if let Err(e) = self.supervisor.persist() {
@@ -793,6 +969,9 @@ fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
         log_cfg,
         boot_id: identity::read_boot_id(),
         usage_start,
+        deep_scheduler: pilot::DeepScheduler::default(),
+        context_snapshot: HashMap::new(),
+        owner_snapshot: HashMap::new(),
     };
     loop {
         match obs.cycle() {
@@ -922,6 +1101,32 @@ mod pilot_gap_tests {
         (p, rel)
     }
 
+    #[test]
+    fn durable_diff_treats_pid_reuse_as_death_and_birth() {
+        let old = identity::ProcessIdentity {
+            boot_id: Some("boot".into()),
+            pid: 9,
+            start_ticks: 10,
+            uid: Some(1),
+            exe: "old".into(),
+        };
+        let new = identity::ProcessIdentity {
+            start_ticks: 11,
+            exe: "new".into(),
+            ..old.clone()
+        };
+        let changes = durable_identity_diff(&[(9, old)], &[(9, new)]);
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change, DurableChange::Disappeared(_))));
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change, DurableChange::Appeared(_))));
+        assert!(!changes
+            .iter()
+            .any(|change| matches!(change, DurableChange::Changed(_, _))));
+    }
+
     fn signals(active: Option<bool>) -> Signals {
         Signals {
             owner_reports_active: active,
@@ -992,6 +1197,9 @@ mod pilot_gap_tests {
             log_cfg: logx::LogConfig::new(log_dir),
             boot_id,
             usage_start: stats::self_usage(),
+            deep_scheduler: pilot::DeepScheduler::default(),
+            context_snapshot: HashMap::new(),
+            owner_snapshot: HashMap::new(),
         };
         (obs, root, pid)
     }
