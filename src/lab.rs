@@ -156,6 +156,47 @@ pub fn current_registry() -> io::Result<Vec<Entry>> {
 pub fn registry_path_current() -> PathBuf {
     registry_path()
 }
+
+/// Append durable, lab-scoped close receipts beside the lab registry.
+pub fn receipt_path_current() -> PathBuf {
+    registry_path().with_extension("receipts.jsonl")
+}
+
+pub fn persist_close_receipt(entry: &Entry, stages: &[String], verdict: &str) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    static RECEIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = RECEIPT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = receipt_path_current();
+    fs::create_dir_all(path.parent().unwrap())?;
+    let quote = |value: &str| -> String {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    let stages = stages
+        .iter()
+        .map(|stage| quote(stage))
+        .collect::<Vec<_>>()
+        .join(",");
+    let timestamp = now();
+    let line = format!(
+        "{{\"scope\":\"reaper-lab\",\"pid\":{},\"start_ticks\":{},\"spawned_at\":{},\"stages\":[{}],\"authorization_refs\":[\"proven\",\"policy_recomputed\",\"lab_registry\"],\"timestamp\":{},\"verdict\":{}}}\n",
+        entry.pid, entry.start_ticks, entry.spawned_at, stages, timestamp, quote(verdict)
+    );
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    if file.write(line.as_bytes())? != line.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "lab receipt append was partial",
+        ));
+    }
+    file.sync_all()?;
+    eprintln!("lab close receipt pid={} verdict={verdict}", entry.pid);
+    Ok(())
+}
 fn register(entry: &Entry) -> io::Result<()> {
     let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = registry_path();

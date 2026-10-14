@@ -111,8 +111,41 @@ fn run_lab_cycle_with_work(
         no_pending_work,
     };
     if !evidence::proven(&ev) {
+        eprintln!("lab close refused: unproven abandonment evidence: {ev:?}");
         return Err(io::Error::other("abandonment evidence incomplete"));
     }
+    // Recompute policy at the final gate from the fresh process snapshot and
+    // the cycle's verified lab-only client/work observation. No approval token
+    // is accepted from a caller.
+    let fresh = crate::procfs::scan();
+    let process = fresh
+        .processes
+        .iter()
+        .find(|process| process.pid == entry.pid && process.start_ticks == entry.start_ticks)
+        .ok_or_else(|| io::Error::other("policy approval refused: fresh identity unavailable"))?;
+    let relations = crate::relations::build(&fresh.processes);
+    let protection =
+        crate::protection::protect(process, std::process::id(), &relations, process.uid);
+    let (owner_reports_active, _) = evidence::client_work_to_fields(&idle);
+    let approval = crate::policy::decide(
+        &crate::policy::Policy::default(),
+        &protection,
+        process,
+        &crate::policy::Signals {
+            owner_reports_active: owner_reports_active.map(|idle| !idle),
+            proven_abandoned: evidence::proven(&ev),
+            needs_tolerance: false,
+            memory_pressure: false,
+            client_coverage: crate::client_tracker::Coverage::CompleteVerified,
+        },
+    );
+    if !matches!(approval, crate::policy::Decision::GraceCandidate { .. }) {
+        eprintln!("lab close refused: recomputed policy approval={approval:?}");
+        return Err(io::Error::other(format!(
+            "recomputed policy did not approve close: {approval:?}"
+        )));
+    }
+    eprintln!("lab close gate approved: proven evidence and recomputed policy");
     let record = LabRecord {
         pid: entry.pid,
         start_ticks: entry.start_ticks,
@@ -158,6 +191,7 @@ fn run_lab_cycle_with_work(
         "lab-cycle.audit pid={} start_ticks={} outcome=closed",
         entry.pid, entry.start_ticks
     ));
+    crate::lab::persist_close_receipt(&child.entry, &receipts, "closed")?;
     Ok(CycleReport {
         outcome: Outcome::Closed,
         stages,
@@ -185,6 +219,24 @@ mod tests {
         let closed = run_lab_cycle(&mut child, Duration::from_millis(5), false).unwrap();
         assert_eq!(closed.outcome, Outcome::Closed);
         assert!(closed.receipts.iter().any(|r| r.contains("audit")));
+        let receipt_path = crate::lab::receipt_path_current();
+        let persisted = std::fs::read_to_string(receipt_path).unwrap();
+        assert!(persisted.contains(&format!("\"pid\":{}", entry.pid)));
+        assert!(persisted.contains(&format!("\"start_ticks\":{}", entry.start_ticks)));
+        assert!(persisted.contains("\"verdict\":\"closed\""));
+        assert!(persisted.contains("\"scope\":\"reaper-lab\""));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(crate::lab::receipt_path_current())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         drop(child);
         assert_ne!(
             crate::lab::identity_ticks(entry.pid).ok(),
