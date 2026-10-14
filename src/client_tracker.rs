@@ -337,6 +337,59 @@ pub fn save_at(registry: &Registry, path: &Path) -> io::Result<()> {
     f.sync_all()?;
     fs::rename(tmp, path)
 }
+
+/// Record the explicitly controlled client's verified lifecycle for a lab service.
+pub fn record_lab_client(
+    pid: u32,
+    start_ticks: u64,
+    server: &str,
+    nonce: &str,
+    connected: bool,
+    active_work_ids: Vec<String>,
+) -> io::Result<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if process_start_ticks(pid).ok() != Some(start_ticks) {
+        return Err(io::Error::other("lab client identity is stale"));
+    }
+    let mut registry = current_registry()?;
+    let boot_id = boot_id()?;
+    let project_dir = std::env::current_dir()?.display().to_string();
+    let state = if connected {
+        ClientState::ConnectedVerified {
+            evidence: "live loopback lab handshake".into(),
+            provenance: "managed-service client identity and proc start_ticks".into(),
+        }
+    } else {
+        ClientState::EndedVerified {
+            evidence: "client disconnect observed by managed service".into(),
+            provenance: "managed-service lab event".into(),
+        }
+    };
+    let record = ClientRecord {
+        identity: ClientIdentity {
+            tool: "reaper-managed-service-lab".into(),
+            project_dir,
+            server: server.into(),
+            nonce: nonce.into(),
+            pid,
+            start_ticks,
+            boot_id,
+        },
+        state,
+        active_work_ids,
+    };
+    if let Some(existing) = registry.clients.iter_mut().find(|existing| {
+        existing.identity.pid == pid
+            && existing.identity.start_ticks == start_ticks
+            && existing.identity.nonce == nonce
+    }) {
+        *existing = record;
+    } else {
+        registry.clients.push(record);
+    }
+    save_at(&registry, &registry_path())
+}
 pub fn current_registry() -> io::Result<Registry> {
     load_at(&registry_path())
 }

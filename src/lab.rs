@@ -234,6 +234,31 @@ fn register(entry: &Entry) -> io::Result<()> {
     write_registry(&entries, &path)
 }
 
+/// Register an already-running service only after its process identity is read live.
+pub fn register_managed_service(pid: u32, ticks: u64) -> io::Result<Entry> {
+    if start_ticks(pid)? != ticks {
+        return Err(io::Error::other(
+            "managed service identity changed before registration",
+        ));
+    }
+    let entry = Entry {
+        pid,
+        start_ticks: ticks,
+        spawned_at: now(),
+    };
+    register(&entry)?;
+    Ok(entry)
+}
+
+/// Remove exactly this service identity from the lab roster after confirmed exit.
+pub fn unregister_managed_service(entry: &Entry) -> io::Result<()> {
+    let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = registry_path();
+    let mut entries = read_registry_at(&path)?;
+    entries.retain(|candidate| candidate != entry);
+    write_registry(&entries, &path)
+}
+
 /// Spawn only known sleeper commands, then persist the exact child identity.
 pub fn spawn(ignores_term: bool) -> io::Result<LabChild> {
     let sleep = resolve_tool("sleep")?;
