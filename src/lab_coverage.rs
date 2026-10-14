@@ -297,12 +297,16 @@ mod tests {
             crate::client_tracker::Coverage::Unknown
         );
         assert_eq!(
-            crate::client_tracker::CoverageProof {
-                all_transports_observed: false,
-                no_uncontrolled_path: false,
-                source_healthy: true,
-            }
-            .coverage(),
+            crate::client_tracker::CoverageProof::issue_verified(
+                vec!["http".into()],
+                "lab-server",
+                1,
+                30,
+                "lab event capture",
+                "loopback only",
+            )
+            .unwrap()
+            .invalidate(crate::client_tracker::ProofInvalidation::EventLoss),
             crate::client_tracker::Coverage::Unknown
         );
     }

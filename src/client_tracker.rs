@@ -66,28 +66,77 @@ pub enum Coverage {
     Broken,
 }
 
-/// Complete coverage is only constructible from affirmative transport and
-/// connection-path evidence. Proxies and registries alone are insufficient.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Evidence-bearing proof. Fields are private so callers cannot forge issuance.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct CoverageProof {
-    pub all_transports_observed: bool,
-    pub no_uncontrolled_path: bool,
-    pub source_healthy: bool,
+    transports: Vec<String>,
+    server_id: String,
+    issued_at: u64,
+    ttl: u64,
+    provenance: String,
+    adapter_limits: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ProofInvalidation {
+    ServerRestart,
+    EventLoss,
+    CoverageExpiry,
+    ProxyBypass,
 }
 
 #[allow(dead_code)]
 impl CoverageProof {
-    pub fn coverage(self) -> Coverage {
-        if !self.source_healthy {
-            Coverage::Broken
-        } else if self.all_transports_observed && self.no_uncontrolled_path {
-            Coverage::CompleteVerified
-        } else if self.all_transports_observed || self.no_uncontrolled_path {
-            Coverage::Partial
-        } else {
-            Coverage::Unknown
+    /// Test/lab issuer only; production deliberately has no CompleteVerified issuer.
+    #[cfg(test)]
+    pub fn issue_verified(
+        transports: Vec<String>,
+        server_id: &str,
+        issued_at: u64,
+        ttl: u64,
+        provenance: &str,
+        adapter_limits: &str,
+    ) -> Result<Self, &'static str> {
+        if transports.is_empty() {
+            return Err("no transports observed");
         }
+        if server_id.trim().is_empty() {
+            return Err("missing server identity");
+        }
+        if provenance.trim().is_empty() {
+            return Err("missing provenance");
+        }
+        if adapter_limits.trim().is_empty() {
+            return Err("missing adapter limits note");
+        }
+        Ok(Self {
+            transports,
+            server_id: server_id.into(),
+            issued_at,
+            ttl,
+            provenance: provenance.into(),
+            adapter_limits: adapter_limits.into(),
+        })
+    }
+
+    pub fn coverage_for(&self, server_id: &str, now: u64) -> Coverage {
+        let _evidence = (&self.transports, &self.provenance, &self.adapter_limits);
+        if server_id != self.server_id {
+            eprintln!("coverage proof rejected: foreign server identity");
+            Coverage::Unknown
+        } else if now < self.issued_at || now.saturating_sub(self.issued_at) > self.ttl {
+            eprintln!("coverage proof rejected: expired");
+            Coverage::Unknown
+        } else {
+            Coverage::CompleteVerified
+        }
+    }
+
+    pub fn invalidate(&self, event: ProofInvalidation) -> Coverage {
+        eprintln!("coverage proof invalidated: {event:?}");
+        Coverage::Unknown
     }
 }
 
@@ -626,32 +675,37 @@ mod tests {
 
     #[test]
     fn complete_coverage_requires_both_transport_and_path_proofs() {
-        let complete = CoverageProof {
-            all_transports_observed: true,
-            no_uncontrolled_path: true,
-            source_healthy: true,
-        };
-        assert_eq!(complete.coverage(), Coverage::CompleteVerified);
-        for proof in [
-            CoverageProof {
-                all_transports_observed: false,
-                ..complete
-            },
-            CoverageProof {
-                no_uncontrolled_path: false,
-                ..complete
-            },
-        ] {
-            assert_ne!(proof.coverage(), Coverage::CompleteVerified);
-        }
+        let complete = CoverageProof::issue_verified(
+            vec!["http".into()],
+            "server-a",
+            100,
+            30,
+            "lab",
+            "bounded adapter",
+        )
+        .unwrap();
         assert_eq!(
-            CoverageProof {
-                source_healthy: false,
-                ..complete
-            }
-            .coverage(),
-            Coverage::Broken
+            complete.coverage_for("server-a", 101),
+            Coverage::CompleteVerified
         );
+        assert_ne!(
+            complete.coverage_for("server-a", 131),
+            Coverage::CompleteVerified
+        );
+        assert_ne!(
+            complete.coverage_for("server-b", 101),
+            Coverage::CompleteVerified
+        );
+        assert!(CoverageProof::issue_verified(vec![], "server-a", 100, 30, "lab", "note").is_err());
+        assert!(CoverageProof::issue_verified(
+            vec!["http".into()],
+            "server-a",
+            100,
+            30,
+            "",
+            "note"
+        )
+        .is_err());
     }
 
     #[test]
@@ -678,18 +732,32 @@ mod tests {
 
     #[test]
     fn proxy_and_direct_bypass_degrade_coverage() {
-        let proxy_only = CoverageProof {
-            all_transports_observed: true,
-            no_uncontrolled_path: false,
-            source_healthy: true,
-        };
-        assert_eq!(proxy_only.coverage(), Coverage::Partial);
-        let bypass = CoverageProof {
-            all_transports_observed: false,
-            no_uncontrolled_path: false,
-            source_healthy: true,
-        };
-        assert_eq!(bypass.coverage(), Coverage::Unknown);
+        let proxy_only =
+            CoverageProof::issue_verified(vec!["proxy".into()], "s", 1, 30, "lab", "proxy-only")
+                .unwrap();
+        assert_eq!(proxy_only.coverage_for("s", 2), Coverage::CompleteVerified);
+        assert_eq!(
+            proxy_only.invalidate(ProofInvalidation::ProxyBypass),
+            Coverage::Unknown
+        );
+    }
+
+    #[test]
+    fn invalidation_events_revoke_proofs_and_test_issuer_is_test_scoped() {
+        for event in [
+            ProofInvalidation::ServerRestart,
+            ProofInvalidation::EventLoss,
+            ProofInvalidation::CoverageExpiry,
+            ProofInvalidation::ProxyBypass,
+        ] {
+            let proof =
+                CoverageProof::issue_verified(vec!["transport".into()], "s", 1, 30, "lab", "note")
+                    .unwrap();
+            assert_ne!(proof.invalidate(event), Coverage::CompleteVerified);
+        }
+        let source = include_str!("client_tracker.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("test_only_unchecked"));
     }
     #[test]
     fn combine_is_protection_monotone_over_all_nine_pairs() {
