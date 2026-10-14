@@ -126,7 +126,7 @@ impl CoverageProof {
         if server_id != self.server_id {
             eprintln!("coverage proof rejected: foreign server identity");
             Coverage::Unknown
-        } else if now < self.issued_at || now.saturating_sub(self.issued_at) > self.ttl {
+        } else if now < self.issued_at || now.saturating_sub(self.issued_at) >= self.ttl {
             eprintln!("coverage proof rejected: expired");
             Coverage::Unknown
         } else {
@@ -762,6 +762,10 @@ mod tests {
             Coverage::CompleteVerified
         );
         assert_ne!(
+            complete.coverage_for("server-a", 130),
+            Coverage::CompleteVerified
+        );
+        assert_ne!(
             complete.coverage_for("server-b", 101),
             Coverage::CompleteVerified
         );
@@ -809,6 +813,78 @@ mod tests {
             proxy_only.invalidate(ProofInvalidation::ProxyBypass),
             Coverage::Unknown
         );
+    }
+
+    #[test]
+    fn bypass_and_event_loss_block_close_while_broken_registry_stays_blocked() {
+        let process = crate::procfs::Process {
+            pid: 9,
+            ppid: 1,
+            pgrp: 9,
+            session: 9,
+            start_ticks: 5,
+            state: 'S',
+            name: "svc".into(),
+            command: "svc".into(),
+            rss_kib: 0,
+            swap_kib: 0,
+            uid: Some(10373),
+        };
+        for event in [ProofInvalidation::ProxyBypass, ProofInvalidation::EventLoss] {
+            let proof = CoverageProof::issue_verified(
+                vec!["uds".into()],
+                "server-a",
+                1,
+                30,
+                "controlled UDS lab",
+                "bounded lab adapter",
+            )
+            .unwrap();
+            let coverage = proof.invalidate(event);
+            assert_eq!(coverage, Coverage::Unknown);
+            let signals = crate::policy::Signals {
+                owner_reports_active: Some(false),
+                proven_abandoned: true,
+                needs_tolerance: false,
+                memory_pressure: false,
+                client_coverage: coverage,
+            };
+            assert!(matches!(
+                crate::policy::decide(
+                    &crate::policy::Policy::default(),
+                    &crate::protection::Protection {
+                        tier: crate::protection::Tier::Known,
+                        reason: "lab".into(),
+                    },
+                    &process,
+                    &signals,
+                ),
+                crate::policy::Decision::Blocked { .. }
+            ));
+        }
+        assert_eq!(
+            registry_coverage(&Err(io::Error::other("registry unreadable"))),
+            Coverage::Broken
+        );
+        let broken = crate::policy::Signals {
+            owner_reports_active: Some(false),
+            proven_abandoned: true,
+            needs_tolerance: false,
+            memory_pressure: false,
+            client_coverage: Coverage::Broken,
+        };
+        assert!(matches!(
+            crate::policy::decide(
+                &crate::policy::Policy::default(),
+                &crate::protection::Protection {
+                    tier: crate::protection::Tier::Known,
+                    reason: "lab".into(),
+                },
+                &process,
+                &broken,
+            ),
+            crate::policy::Decision::Blocked { .. }
+        ));
     }
 
     #[test]

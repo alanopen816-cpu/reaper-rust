@@ -65,6 +65,37 @@ struct ServiceState {
 }
 type Ledger = Arc<Mutex<ServiceState>>;
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceTransport {
+    Uds,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConstructionTransportEvidence {
+    transports: &'static [ServiceTransport],
+}
+
+#[cfg(unix)]
+impl ConstructionTransportEvidence {
+    const UDS_ONLY: Self = Self {
+        transports: &[ServiceTransport::Uds],
+    };
+
+    fn is_uds_only(self) -> bool {
+        self.transports == [ServiceTransport::Uds]
+    }
+
+    fn label(self) -> &'static str {
+        if self.is_uds_only() {
+            "uds-only"
+        } else {
+            "other"
+        }
+    }
+}
+
 fn spawn_service_process() -> io::Result<std::process::Child> {
     let executable = std::env::current_exe()?;
     let mut command = std::process::Command::new(executable);
@@ -307,6 +338,73 @@ fn tcp_listener_present() -> io::Result<bool> {
 #[cfg(test)]
 mod tcp_listener_tests {
     use super::*;
+
+    #[test]
+    fn construction_transport_evidence_is_uds_only() {
+        let evidence = ConstructionTransportEvidence::UDS_ONLY;
+        assert!(evidence.is_uds_only());
+        assert_eq!(evidence.label(), "uds-only");
+    }
+
+    #[test]
+    fn controlled_uds_proof_transitions_unknown_to_fresh_lab_approval() {
+        use crate::client_tracker::{Coverage, CoverageProof};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let evidence = ConstructionTransportEvidence::UDS_ONLY;
+        assert!(evidence.is_uds_only());
+        let mut coverage = Coverage::Unknown;
+        assert_eq!(coverage, Coverage::Unknown);
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let proof = CoverageProof::issue_verified(
+            vec!["uds".into()],
+            "controlled-lab-server",
+            issued_at,
+            60,
+            "exhaustive controlled UDS entry",
+            "server- and TTL-window-scoped lab adapter",
+        )
+        .unwrap();
+        coverage = proof.coverage_for("controlled-lab-server", issued_at);
+        assert_eq!(coverage, Coverage::CompleteVerified);
+
+        let process = crate::procfs::scan()
+            .processes
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .expect("test process present in procfs scan");
+        let approval = crate::terminate::approve_fresh(crate::terminate::FreshApprovalInputs {
+            evidence: crate::evidence::AbandonEvidence {
+                lab_member: true,
+                owner: crate::owner::OwnerVerdict::Unclaimed,
+                grace_expired: true,
+                revalidated_now: true,
+                owner_dead: Some(true),
+                last_client_gone: Some(true),
+                no_pending_work: Some(true),
+            },
+            process,
+            protection: crate::protection::Protection {
+                tier: crate::protection::Tier::Known,
+                reason: "controlled UDS lab".into(),
+            },
+            policy: crate::policy::Policy::default(),
+            signals: crate::policy::Signals {
+                owner_reports_active: Some(false),
+                proven_abandoned: true,
+                needs_tolerance: false,
+                memory_pressure: false,
+                client_coverage: coverage,
+            },
+        });
+        assert!(
+            approval.is_some(),
+            "complete controlled UDS evidence authorizes lab approval"
+        );
+    }
 
     #[test]
     fn managed_restart_budget_enforces_cap_and_authorization() {
@@ -662,6 +760,7 @@ pub fn serve_uds() -> io::Result<()> {
     let path = std::env::var_os("REAPER_LAB_SERVICE_SOCKET")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing lab UDS path"))?;
+    let transport_evidence = ConstructionTransportEvidence::UDS_ONLY;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("UDS path has no parent"))?;
@@ -920,6 +1019,9 @@ pub fn serve_uds() -> io::Result<()> {
                         u8::from(owner_active),
                         u8::from(tcp_disabled)
                     )
+                }
+                ["TRANSPORT-EVIDENCE"] => {
+                    format!("TRANSPORT-EVIDENCE {}\n", transport_evidence.label())
                 }
                 ["SHUTDOWN"] => {
                     let state = ledger.lock().unwrap_or_else(|e| e.into_inner());

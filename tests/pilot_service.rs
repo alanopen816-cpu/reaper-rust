@@ -239,6 +239,14 @@ fn unix_service_reports_kernel_supplied_scm_credentials() {
         &["0", "1", "1", "0"][..]
     };
     assert_eq!(&attestation_fields[5..], expected);
+    let construction_evidence = {
+        let mut stream = UnixStream::connect(&socket_path).unwrap();
+        stream.write_all(b"TRANSPORT-EVIDENCE\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    };
+    assert_eq!(construction_evidence, "TRANSPORT-EVIDENCE uds-only\n");
     let mut unregistered = UnixStream::connect(&socket_path).unwrap();
     unregistered.write_all(b"REGISTER rogue-peer\n").unwrap();
     let mut refused = String::new();
