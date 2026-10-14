@@ -53,6 +53,19 @@ pub fn proven(ev: &AbandonEvidence) -> bool {
         && ev.no_pending_work == Some(true)
 }
 
+/// Entry-only grade: all abandonment inputs except elapsed grace and fresh
+/// revalidation. It can start grace, but must never authorize close readiness.
+pub fn candidate_for_grace(ev: &AbandonEvidence) -> bool {
+    ev.lab_member
+        && matches!(
+            ev.owner,
+            OwnerVerdict::Unclaimed | OwnerVerdict::ClaimedDown { .. }
+        )
+        && ev.owner_dead == Some(true)
+        && ev.last_client_gone == Some(true)
+        && ev.no_pending_work == Some(true)
+}
+
 pub fn positive_vs_absent(ev: &AbandonEvidence) -> Option<bool> {
     if !ev.lab_member || !ev.grace_expired || !ev.revalidated_now {
         None
@@ -77,6 +90,27 @@ mod tests {
             last_client_gone: Some(true),
             no_pending_work: Some(true),
         }
+    }
+    #[test]
+    fn candidate_grade_authorizes_entry_but_never_close() {
+        let mut e = evidence();
+        e.grace_expired = false;
+        e.revalidated_now = false;
+        assert!(candidate_for_grace(&e));
+        assert!(!proven(&e));
+    }
+
+    #[test]
+    fn candidate_grade_requires_every_entry_evidence_input() {
+        let mut e = evidence();
+        e.grace_expired = false;
+        e.revalidated_now = false;
+        assert!(candidate_for_grace(&e));
+        e.no_pending_work = None;
+        assert!(!candidate_for_grace(&e));
+        e.no_pending_work = Some(true);
+        e.owner_dead = Some(false);
+        assert!(!candidate_for_grace(&e));
     }
     #[test]
     fn every_required_piece_is_mandatory() {

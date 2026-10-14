@@ -115,7 +115,13 @@ fn decide_state(decision: &Decision, current: Option<State>) -> State {
             Tier::Contextual | Tier::Known => State::Observing,
         },
         Decision::Observe { .. } => State::Observing,
-        Decision::GraceCandidate { .. } => State::GracePeriod,
+        Decision::GraceCandidate { .. } => {
+            if current == Some(State::Candidate) {
+                State::GracePeriod
+            } else {
+                State::Candidate
+            }
+        }
         Decision::ReadyForRevalidation { .. } => State::ReadyForRevalidation,
         Decision::Blocked { .. } => {
             // A blocked process that was already terminally protected stays put.
@@ -410,13 +416,12 @@ impl Observer {
                     )?;
                 }
             }
-            // Terminal states persist without re-evaluation in Phase 2: no
-            // evidence source can advance them here, and disappearance is
-            // handled through events above. (Phase 3 re-opens them on change.)
+            // READY_FOR_REVALIDATION is deliberately reopened below; other
+            // terminal states remain fail-closed until disappearance/change.
             if self
                 .supervisor
                 .state_of(p.pid)
-                .is_some_and(|s| s.terminal())
+                .is_some_and(|s| s.terminal() && s != State::ReadyForRevalidation)
             {
                 continue;
             }
@@ -485,11 +490,15 @@ impl Observer {
                 }
             };
             let (last_client_gone, no_pending_work) = evidence::client_work_to_fields(&client_work);
+            let current = self.supervisor.state_of(p.pid);
+            let grace_expired = current == Some(State::ReadyForRevalidation)
+                || (current == Some(State::GracePeriod)
+                    && self.supervisor.grace_expired(p.pid, now));
             let ev = evidence::AbandonEvidence {
                 lab_member,
                 owner: owner_evidence.clone(),
-                grace_expired: false,
-                revalidated_now: false,
+                grace_expired,
+                revalidated_now: grace_expired,
                 owner_dead: match owner_active {
                     Some(false) => Some(true),
                     Some(true) => Some(false),
@@ -501,7 +510,7 @@ impl Observer {
             let _absence = evidence::positive_vs_absent(&ev);
             let signals = Signals {
                 owner_reports_active: owner_active,
-                proven_abandoned: evidence::proven(&ev),
+                proven_abandoned: evidence::candidate_for_grace(&ev),
                 needs_tolerance: false,
                 memory_pressure: false,
                 client_coverage: coverage,
@@ -519,7 +528,7 @@ impl Observer {
             };
             let classification_activity =
                 client_tracker::combine_signals(owner_active, work_activity);
-            let (_class, _prot, decision) = classified_decision(
+            let (_class, _prot, mut decision) = classified_decision(
                 p,
                 &id,
                 &rel,
@@ -531,7 +540,20 @@ impl Observer {
                 &signals,
                 &[],
             );
-            let current = self.supervisor.state_of(p.pid);
+            if current == Some(State::ReadyForRevalidation) {
+                decision = if evidence::proven(&ev)
+                    && coverage == client_tracker::Coverage::CompleteVerified
+                {
+                    Decision::ReadyForRevalidation {
+                        reason: "fresh post-grace evidence and policy revalidation passed".into(),
+                    }
+                } else {
+                    Decision::Blocked {
+                        reason: "fresh post-grace evidence or complete client coverage missing"
+                            .into(),
+                    }
+                };
+            }
             // Rescue during grace: owner evidence flipped back while we hold a
             // deadline — cancel explicitly and say so.
             if current == Some(State::GracePeriod)
@@ -572,13 +594,6 @@ impl Observer {
             // above and disappearance is handled through events).
             let from = current.unwrap_or(State::Discovered);
             if next != from {
-                if matches!(next, State::GracePeriod) {
-                    let grace = match &decision {
-                        Decision::GraceCandidate { grace_secs, .. } => *grace_secs,
-                        _ => self.policy.grace_known_secs,
-                    };
-                    self.supervisor.arm_grace(p.pid, now + grace);
-                }
                 let t = self.supervisor.transition(
                     &id,
                     next,
@@ -604,9 +619,13 @@ impl Observer {
                         t.reason
                     ),
                 )?;
-            } else if matches!(next, State::GracePeriod) && current.is_none() {
-                self.supervisor
-                    .arm_grace(p.pid, now + self.policy.grace_known_secs);
+                if matches!(next, State::GracePeriod) {
+                    let grace = match &decision {
+                        Decision::GraceCandidate { grace_secs, .. } => *grace_secs,
+                        _ => self.policy.grace_known_secs,
+                    };
+                    self.supervisor.arm_grace(p.pid, now + grace);
+                }
             }
         }
 
@@ -910,6 +929,30 @@ mod pilot_gap_tests {
             memory_pressure: false,
             client_coverage: client_tracker::Coverage::Unknown,
         }
+    }
+
+    #[test]
+    fn candidate_evidence_enters_candidate_before_grace() {
+        assert_eq!(
+            decide_state(
+                &Decision::GraceCandidate {
+                    grace_secs: 300,
+                    reason: "candidate evidence".into(),
+                },
+                None,
+            ),
+            State::Candidate
+        );
+        assert_eq!(
+            decide_state(
+                &Decision::GraceCandidate {
+                    grace_secs: 300,
+                    reason: "candidate evidence".into(),
+                },
+                Some(State::Candidate),
+            ),
+            State::GracePeriod
+        );
     }
 
     #[test]
