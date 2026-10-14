@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.7.0-perf-coverage-tui — 2026-10-14 (branch `feature/reaper-v0.7`, base `feature/client-tracking-tui@7567405`)
+
+Fast supervisor/TUI scans, verifiable client-coverage contract, real per-process
+CPU in the TUI, evidence-based classification, lab-demonstrated autonomous
+cycle. Still read-only + dry-run in production; all 12 safety rules hold
+(independent audit: HOLD, safe to close).
+
+Benchmarks before → after (measured on-device, smokes unless noted):
+
+| Metric | v0.6 | v0.7 |
+|---|---|---|
+| `pilot report` wall | ~107 s (ambient probes) | Fast <1 s (scan 7–38 ms); Deep bounded 35 s on demand |
+| Supervisor RSS | 3.8 MB (release, v0.6) | ~5.3 MB (debug; same order, release TBD) |
+| Supervisor CPU idle | ~0.3% core | ~0.4% core (2 ticks/5 s, debug) |
+| TUI RSS | 4.2 MB | ~4.3 MB debug (4376 KB peak, real frame) |
+| Per-process CPU | `—` placeholder | real /proc deltas, CLK_TCK discovered, `—` when uncomputable |
+| Release binary default | 1048104 B | 1175848 B (+12%, new lab/coverage code) |
+| Release binary tui | 1604640 B | 1809856 B (+13%) |
+| Aux spawns (Fast) | uncounted | 0, counted per spawn site |
+| State logs | ~163 KB | 180 KB, bounded daily JSONL |
+| Tests default / tui | 88+2+2 / 93+2+2 | 111 / 124, zero deleted to get green |
+
+Added:
+- P1 Fast/Deep split — Fast never blocks on slow adapters (defer→Unknown),
+  batched registry reads, stage metrics, bounded Deep with shared-deadline
+  waits + child kill, per-site spawn counting, tiny-budget regression.
+- P2 coverage contract — `Coverage{CompleteVerified,Partial,Unknown,Broken}`;
+  production `coverage()` hardcodes Unknown, registry caps at Partial, proofs
+  test-only: CompleteVerified unreachable in production by construction.
+  Loopback lab drives 10/12 scenarios end-to-end (grace-timer + durable
+  restart identity partial, marked); bypass degrades; prod never proxied.
+- P3 TUI — CPU-delta map (shared Process untouched), async snapshots,
+  skip-busy refresh, verifiable-only stats bar, real hierarchy,
+  clients/evidence/help views, resize/zero-size safety, multi-TUI lock-in.
+- P4 taxonomy — evidence-based classes + extension hook + class→tier map
+  (additive; runtime call-site wiring deferred, live behavior unchanged).
+- P5 autonomy — lab-scoped driver, own short grace (production 300 s
+  untouched), cancel + close branches, real TERM on lab-owned child via
+  registry gate (no SIGKILL), CLI refusal verified safe.
+- `tests/autonomy.rs`, `src/lab_coverage.rs`, `src/lab_autonomy.rs`.
+
+Verified: fmt, clippy ×2, tests ×2, release builds ×2, all 6 labs incl.
+gated live-server coverage (13 s, self-cleaning), regression matrix
+(multi-TUI closed test-only), TUI pty smokes both sizes, zero strays,
+production untouched. Full-suite suite wall dominated by release builds
+(30 s) + bounded Deep (35 s).
+
+Known limits: OpenCode in-flight child kill missing (waits stay bounded);
+grace timer + durable restart identity need state.rs; CoverageProof fields
+public (test-only risk); classifier mapping has no production caller;
+discovery/disconnect fixtures scripted in autonomy lab; audit receipt in
+memory; TUI own-CPU metrics limited; /proc/net/* denied on this Termux;
+`cargo test client_coverage` bare matches zero tests (use --test).
+First real close still requires presence signal + human review + RDD.
+
+Process note: ~2124 authored lines across 9 work-unit commits on the
+feature branch; the ask-on-risk chain-strategy question was never asked
+before crossing the ~400-line budget — delivery stays a single branch,
+no PR created (push/PR/merge remain the user's decisions).
+
 ## v0.6.0-tracking-tui — 2026-10-14 (branch `feature/client-tracking-tui`, base `phase-pilot@1a66949`)
 
 Managed client tracking + phone TUI. Supervision stays singleton, read-only
