@@ -18,6 +18,7 @@ pub struct FreshApproval {
     boot_id: String,
     uid: u32,
     executable: String,
+    cmdline: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,7 @@ struct ProcessTuple {
     boot_id: String,
     uid: u32,
     executable: String,
+    cmdline: Vec<u8>,
 }
 
 fn read_process_tuple(pid: u32) -> std::io::Result<ProcessTuple> {
@@ -52,10 +54,8 @@ fn read_process_tuple(pid: u32) -> std::io::Result<ProcessTuple> {
         .ok_or_else(|| std::io::Error::other("start ticks unavailable in /proc stat"))?
         .parse()
         .map_err(|_| std::io::Error::other("invalid start ticks in /proc stat"))?;
-    // Require cmdline readability too: it is part of the fresh observation and
-    // an inaccessible proc datum must never silently degrade identity checking.
     let cmdline = fs::read(format!("{base}/cmdline"))?;
-    if cmdline.is_empty() {
+    if cmdline.is_empty() || cmdline.last() != Some(&0) {
         return Err(std::io::Error::other("empty /proc cmdline"));
     }
     let executable = fs::read_link(format!("{base}/exe"))?
@@ -76,6 +76,7 @@ fn read_process_tuple(pid: u32) -> std::io::Result<ProcessTuple> {
         boot_id,
         uid,
         executable,
+        cmdline,
     })
 }
 
@@ -99,7 +100,10 @@ pub fn approve_fresh(inputs: FreshApprovalInputs) -> Option<FreshApproval> {
             return None;
         }
     };
-    if tuple.start_ticks != inputs.process.start_ticks || Some(tuple.uid) != inputs.process.uid {
+    if tuple.start_ticks != inputs.process.start_ticks
+        || Some(tuple.uid) != inputs.process.uid
+        || tuple.cmdline.split(|byte| *byte == 0).next() != Some(inputs.process.command.as_bytes())
+    {
         eprintln!("fresh approval refused: process identity differs from supplied evidence");
         return None;
     }
@@ -109,6 +113,7 @@ pub fn approve_fresh(inputs: FreshApprovalInputs) -> Option<FreshApproval> {
         boot_id: tuple.boot_id,
         uid: tuple.uid,
         executable: tuple.executable,
+        cmdline: tuple.cmdline,
     })
 }
 
@@ -236,9 +241,10 @@ fn tuple_matches(pid: u32, ticks: u64, expected: &FreshApproval) -> bool {
                 && actual.start_ticks == expected.start_ticks
                 && actual.boot_id == expected.boot_id
                 && actual.uid == expected.uid
-                && actual.executable == expected.executable;
+                && actual.executable == expected.executable
+                && actual.cmdline == expected.cmdline;
             if !matches {
-                eprintln!("signal refused: full process identity tuple changed (pid/start/boot/uid/executable)");
+                eprintln!("signal refused: full process identity tuple changed (pid/start/boot/uid/executable/cmdline)");
             }
             matches
         }
@@ -364,6 +370,7 @@ pub(crate) fn test_approval(pid: u32, start_ticks: u64) -> FreshApproval {
         boot_id: String::new(),
         uid: 0,
         executable: String::new(),
+        cmdline: Vec::new(),
     }
 }
 // Dry-run never calls SignalExecutor; no raw-PID signalling API is exposed.
@@ -418,7 +425,10 @@ mod tests {
             start_ticks: observed.start_ticks,
             state: 'S',
             name: "svc".into(),
-            command: "svc".into(),
+            command: String::from_utf8_lossy(
+                observed.cmdline.split(|byte| *byte == 0).next().unwrap(),
+            )
+            .into_owned(),
             rss_kib: 0,
             swap_kib: 0,
             uid: Some(observed.uid),
@@ -448,6 +458,9 @@ mod tests {
             },
         };
         assert!(approve_fresh(inputs()).is_some());
+        let mut wrong_cmdline = inputs();
+        wrong_cmdline.process.command.push_str("-mismatch");
+        assert!(approve_fresh(wrong_cmdline).is_none());
         let mut stale = inputs();
         stale.evidence.revalidated_now = false;
         assert!(approve_fresh(stale).is_none());
