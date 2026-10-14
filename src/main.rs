@@ -565,7 +565,7 @@ impl Observer {
                     now,
                     "owner:rescue-during-grace",
                     "policy-10",
-                    "client reappeared during grace; close cancelled",
+                    "policy re-evaluation no longer authorizes grace; close cancelled",
                 );
                 st.transitions += 1;
                 st.log_bytes += logx::log(
@@ -953,6 +953,117 @@ mod pilot_gap_tests {
             ),
             State::GracePeriod
         );
+    }
+
+    fn observer_with_tracked_self(state: State) -> (Observer, PathBuf, u32) {
+        let pid = std::process::id();
+        let process = procfs::scan()
+            .processes
+            .into_iter()
+            .find(|process| process.pid == pid)
+            .expect("test process is present in procfs");
+        let boot_id = identity::read_boot_id();
+        let id = identity::identify(&process, boot_id.clone());
+        let root = std::env::temp_dir().join(format!(
+            "reaper-v8t4-cycle-{}-{}-{}",
+            pid,
+            process.start_ticks,
+            state.as_str()
+        ));
+        let state_file = root.join("supervisor.state");
+        let mut supervisor = Supervisor::new(state_file);
+        supervisor.transition(
+            &id,
+            state,
+            1,
+            "test:tracked-self",
+            "test-policy",
+            "deterministic observer-cycle fixture",
+        );
+        if state == State::GracePeriod {
+            supervisor.arm_grace(pid, u64::MAX);
+        }
+        let log_dir = root.join("logs");
+        let obs = Observer {
+            tracker: Tracker::new(boot_id.clone()),
+            supervisor,
+            policy: Policy::default(),
+            log_cfg: logx::LogConfig::new(log_dir),
+            boot_id,
+            usage_start: stats::self_usage(),
+        };
+        (obs, root, pid)
+    }
+
+    #[test]
+    fn expired_grace_revalidates_ready_entry_using_fresh_cycle_evidence() {
+        let (mut obs, root, pid) = observer_with_tracked_self(State::ReadyForRevalidation);
+        obs.cycle().expect("read-only observer cycle succeeds");
+        assert_eq!(
+            obs.supervisor.state_of(pid),
+            Some(State::TerminationBlocked)
+        );
+        let log = fs::read_dir(root.join("logs"))
+            .expect("cycle log directory exists")
+            .filter_map(Result::ok)
+            .map(|entry| fs::read_to_string(entry.path()).expect("read cycle log"))
+            .collect::<String>();
+        assert!(log.contains("fresh post-grace evidence or complete client coverage missing"));
+    }
+
+    #[test]
+    fn policy_rescue_during_grace_cancels_without_readiness() {
+        let (mut obs, root, pid) = observer_with_tracked_self(State::GracePeriod);
+        obs.cycle().expect("read-only observer cycle succeeds");
+        assert_eq!(obs.supervisor.state_of(pid), Some(State::Observing));
+        obs.cycle()
+            .expect("subsequent read-only cycle does not reauthorize stale grace");
+        assert!(!obs
+            .supervisor
+            .state_of(pid)
+            .is_some_and(|state| state == State::ReadyForRevalidation));
+        let log = fs::read_dir(root.join("logs"))
+            .expect("cycle log directory exists")
+            .filter_map(Result::ok)
+            .map(|entry| fs::read_to_string(entry.path()).expect("read cycle log"))
+            .collect::<String>();
+        assert!(log.contains("grace.cancelled"));
+        assert!(log.contains("policy re-evaluation no longer authorizes grace; close cancelled"));
+    }
+
+    #[test]
+    fn candidate_grade_policy_decision_is_not_close_readiness() {
+        let mut ev = evidence::AbandonEvidence {
+            lab_member: true,
+            owner: owner::OwnerVerdict::Unclaimed,
+            grace_expired: false,
+            revalidated_now: false,
+            owner_dead: Some(true),
+            last_client_gone: Some(true),
+            no_pending_work: Some(true),
+        };
+        assert!(evidence::candidate_for_grace(&ev));
+        assert!(!evidence::proven(&ev));
+        let (process, _) = fixture("worker", 1);
+        let decision = policy::decide(
+            &Policy::default(),
+            &Protection {
+                tier: Tier::Known,
+                reason: "test known process".into(),
+            },
+            &process,
+            &Signals {
+                owner_reports_active: Some(false),
+                proven_abandoned: evidence::candidate_for_grace(&ev),
+                needs_tolerance: false,
+                memory_pressure: false,
+                client_coverage: client_tracker::Coverage::CompleteVerified,
+            },
+        );
+        assert!(matches!(decision, Decision::GraceCandidate { .. }));
+        ev.grace_expired = true;
+        ev.revalidated_now = true;
+        assert!(evidence::proven(&ev));
     }
 
     #[test]
