@@ -682,12 +682,23 @@ fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
     let mut supervisor = Supervisor::new(state_file.clone());
     // Recover previous run without trusting old PIDs or timers.
     let outcome = procfs::scan();
-    let live: HashMap<u32, (u64, Option<u32>)> = outcome
+    let live: HashMap<u32, identity::ProcessIdentity> = outcome
         .processes
         .iter()
-        .map(|p| (p.pid, (p.start_ticks, p.uid)))
+        .map(|p| (p.pid, identity::identify(p, boot_id.clone())))
         .collect();
-    let (kept, discarded) = supervisor.reload(&live, logx::now_secs(), 300, &state_file);
+    let (kept, discarded) = match supervisor.reload(&live, logx::now_secs(), 300, &state_file) {
+        Ok(result) => result,
+        Err(e) => {
+            logx::log(
+                &log_cfg,
+                logx::Level::Error,
+                "state.recovery_failed",
+                &format!("error={e}"),
+            )?;
+            return Err(e);
+        }
+    };
     let usage_start = stats::self_usage();
     logx::log(&log_cfg, logx::Level::Info, "observer.started",
         &format!("read_only=true recovered={kept} discarded_recycled={discarded} pidfd={} interval={interval}",
