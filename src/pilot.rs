@@ -451,6 +451,107 @@ fn pidfile(state_dir: &Path) -> std::path::PathBuf {
     state_dir.join("pilot.pid")
 }
 
+pub(crate) fn retry_delay(base_secs: u64, failures: u32) -> Duration {
+    Duration::from_secs(
+        base_secs
+            .saturating_mul(1u64.checked_shl(failures.min(6)).unwrap_or(u64::MAX))
+            .min(300),
+    )
+}
+
+fn monotonic_secs() -> io::Result<u64> {
+    #[repr(C)]
+    struct Timespec {
+        seconds: i64,
+        nanoseconds: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock_id: i32, time: *mut Timespec) -> i32;
+    }
+    let mut now = Timespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    // CLOCK_BOOTTIME advances across device sleep, making sleep gaps observable.
+    if unsafe { clock_gettime(7, &mut now) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u64::try_from(now.seconds)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid monotonic clock"))
+}
+
+fn heartbeat_at(
+    dir: &Path,
+    interval: u64,
+    pid: u32,
+    wall: u64,
+    mono: u64,
+    entries: usize,
+) -> io::Result<Option<String>> {
+    let file = dir.join("pilot.heartbeat");
+    let old = fs::read_to_string(&file).ok();
+    let mut gap = None;
+    let mut since = wall;
+    let mut last_gap = String::new();
+    if let Some(old) = old.as_deref() {
+        let f: Vec<_> = old.trim().split('\t').collect();
+        if f.len() >= 4 {
+            if let (Ok(old_pid), Ok(old_wall), Ok(old_mono)) = (
+                f[0].parse::<u32>(),
+                f[1].parse::<u64>(),
+                f[2].parse::<u64>(),
+            ) {
+                last_gap = f.get(4).copied().unwrap_or("").to_owned();
+                let wall_delta = wall.saturating_sub(old_wall);
+                let mono_delta = mono.saturating_sub(old_mono);
+                if old_pid == pid {
+                    since = f.get(5).and_then(|s| s.parse().ok()).unwrap_or(old_wall);
+                }
+                if old_pid != pid {
+                    gap = Some("restart");
+                } else if wall_delta.abs_diff(mono_delta) > interval.max(5) {
+                    gap = Some("wall_clock_divergence");
+                } else if mono_delta > interval.saturating_mul(2) {
+                    gap = Some("missing_cycles");
+                }
+            }
+        }
+    }
+    if let Some(reason) = gap {
+        last_gap = reason.to_owned();
+    }
+    fs::write(
+        file,
+        format!("{pid}\t{wall}\t{mono}\t{entries}\t{last_gap}\t{since}\n"),
+    )?;
+    if let Some(reason) = gap {
+        let cfg = crate::logx::LogConfig::new(dir.join("logs"));
+        crate::logx::log(
+            &cfg,
+            crate::logx::Level::Warn,
+            "pilot.interruption",
+            &format!(
+                "reason={reason} from_unix={} to_unix={wall}",
+                wall.saturating_sub(interval)
+            ),
+        )?;
+    }
+    Ok(gap.map(str::to_owned))
+}
+
+pub fn heartbeat(state_dir: &Path, interval: u64, entries: usize) -> io::Result<()> {
+    fs::create_dir_all(state_dir)?;
+    heartbeat_at(
+        state_dir,
+        interval,
+        std::process::id(),
+        crate::logx::now_secs(),
+        monotonic_secs()?,
+        entries,
+    )
+    .map(|_| ())
+}
+
 pub struct ObserverLock(std::path::PathBuf);
 
 impl Drop for ObserverLock {
@@ -599,6 +700,7 @@ pub fn start(state_dir: &Path, interval: u64) -> io::Result<()> {
     let child = Command::new(std::env::current_exe()?)
         .arg("observe")
         .arg(interval.to_string())
+        .arg("--pilot-read-only")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -610,6 +712,33 @@ pub fn start(state_dir: &Path, interval: u64) -> io::Result<()> {
     // Never signal a child unless its full recorded identity is available.
     store_record(&path, record)?;
     println!("pilot started pid={}", record.pid);
+    Ok(())
+}
+
+/// Bounded, fast procfs-only smoke path; it never instantiates policy or actuation.
+pub fn smoke(state_dir: &Path, cycles: usize) -> io::Result<()> {
+    if cycles == 0 || cycles > 10_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "smoke cycles must be 1..=10000",
+        ));
+    }
+    let cfg = crate::logx::LogConfig::new(state_dir.join("logs"));
+    for index in 0..cycles {
+        let snapshot = procfs::scan();
+        crate::logx::log(
+            &cfg,
+            crate::logx::Level::Info,
+            "pilot.smoke.snapshot",
+            &format!(
+                "cycle={} entries={} skipped={}",
+                index + 1,
+                snapshot.processes.len(),
+                snapshot.skipped_stat + snapshot.skipped_mismatch
+            ),
+        )?;
+    }
+    println!("pilot smoke complete cycles={cycles}");
     Ok(())
 }
 pub fn status(state_dir: &Path) -> io::Result<()> {
@@ -632,9 +761,27 @@ pub fn status(state_dir: &Path) -> io::Result<()> {
         let lines = fs::read_to_string(state_dir.join("logs/pilot-observe.log"))
             .map(|s| s.lines().count())
             .unwrap_or(0);
+        let heartbeat = fs::read_to_string(state_dir.join("pilot.heartbeat")).unwrap_or_default();
+        let fields: Vec<_> = heartbeat.trim().split('\t').collect();
+        let since = fields
+            .get(5)
+            .copied()
+            .or_else(|| fields.get(1).copied())
+            .unwrap_or("unknown");
+        let snapshot = fields.get(1).copied().unwrap_or("unknown");
+        let entries = fields.get(3).copied().unwrap_or("unknown");
+        let gap = fields
+            .get(4)
+            .copied()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("none");
         println!(
-            "pilot running pid={} uptime_seconds={} log_lines={}",
+            "pilot running pid={} since_unix={} last_snapshot_unix={} entries={} last_gap={} uptime_seconds={} log_lines={}",
             record.pid,
+            since,
+            snapshot,
+            entries,
+            gap,
             (uptime - started).max(0.0) as u64,
             lines
         );
@@ -660,6 +807,8 @@ pub fn stop(state_dir: &Path) -> io::Result<()> {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
+    // Lifecycle-only exception: signal only the pidfile-identity-verified pilot child.
+    // This never targets an observed, managed, or production process.
     if unsafe { kill(record.pid as i32, 15) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -668,22 +817,19 @@ pub fn stop(state_dir: &Path) -> io::Result<()> {
         thread::sleep(Duration::from_millis(50));
     }
     if verified(record) {
-        if unsafe { kill(record.pid as i32, 9) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        println!(
-            "pilot kill receipt pid={} start_ticks={}",
-            record.pid, record.start_ticks
-        );
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline && verified(record) {
-            thread::sleep(Duration::from_millis(20));
-        }
-        if verified(record) {
-            return Err(io::Error::other("verified pilot did not exit after KILL"));
-        }
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "verified pilot did not exit; refusing escalation",
+        ));
     }
     fs::remove_file(path)?;
+    let cfg = crate::logx::LogConfig::new(state_dir.join("logs"));
+    crate::logx::log(
+        &cfg,
+        crate::logx::Level::Info,
+        "pilot.stopped",
+        &format!("pid={} start_ticks={}", record.pid, record.start_ticks),
+    )?;
     println!("pilot stopped pid={}", record.pid);
     Ok(())
 }
@@ -691,6 +837,31 @@ pub fn stop(state_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_detects_restart_and_wall_clock_divergence() {
+        let dir =
+            std::env::temp_dir().join(format!("reaper-heartbeat-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("pilot.heartbeat"), "1\t1000\t100\t12\t\n").unwrap();
+        let result = heartbeat_at(&dir, 30, 2, 1030, 130, 2).unwrap();
+        assert_eq!(result.as_deref(), Some("restart"));
+        let result = heartbeat_at(&dir, 30, 2, 1090, 140, 3).unwrap();
+        assert_eq!(result.as_deref(), Some("wall_clock_divergence"));
+        let result = heartbeat_at(&dir, 30, 2, 1120, 170, 4).unwrap();
+        assert_eq!(result, None);
+        let persisted = fs::read_to_string(dir.join("pilot.heartbeat")).unwrap();
+        assert!(persisted.contains("\twall_clock_divergence\t"));
+        assert!(persisted.contains("\t4\t"));
+        heartbeat(&dir, 30, 5).expect("device monotonic clock and heartbeat persist");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retry_backoff_is_capped() {
+        assert_eq!(retry_delay(5, 0), Duration::from_secs(5));
+        assert_eq!(retry_delay(5, 20), Duration::from_secs(300));
+    }
     #[test]
     fn deep_scheduler_coalesces_pending_work_without_waiting() {
         let scheduler = DeepScheduler::default();

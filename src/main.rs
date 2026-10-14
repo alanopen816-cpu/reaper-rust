@@ -337,6 +337,8 @@ struct Observer {
     owner_snapshot: HashMap<u32, (identity::ProcessIdentity, String)>,
 }
 
+static PILOT_READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl Observer {
     fn cycle(&mut self) -> io::Result<stats::CycleStats> {
         let mut st = stats::CycleStats::new(&self.log_cfg.dir);
@@ -754,43 +756,45 @@ impl Observer {
                             .into(),
                     }
                 };
-                if let Some(entry) = lab::current_registry()?
-                    .into_iter()
-                    .find(|entry| entry.pid == p.pid && entry.start_ticks == p.start_ticks)
-                {
-                    #[cfg(unix)]
-                    let close_result =
-                        if let Some(socket) = std::env::var_os("REAPER_LAB_SERVICE_SOCKET") {
-                            let socket = std::path::PathBuf::from(socket);
-                            if managed_service::attest_lab_service(&entry, &socket).is_ok() {
-                                managed_service::close_ready_service(&entry, &socket)
+                if !PILOT_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(entry) = lab::current_registry()?
+                        .into_iter()
+                        .find(|entry| entry.pid == p.pid && entry.start_ticks == p.start_ticks)
+                    {
+                        #[cfg(unix)]
+                        let close_result =
+                            if let Some(socket) = std::env::var_os("REAPER_LAB_SERVICE_SOCKET") {
+                                let socket = std::path::PathBuf::from(socket);
+                                if managed_service::attest_lab_service(&entry, &socket).is_ok() {
+                                    managed_service::close_ready_service(&entry, &socket)
+                                } else {
+                                    lab::close_ready_entry(&entry)
+                                }
                             } else {
                                 lab::close_ready_entry(&entry)
+                            };
+                        #[cfg(not(unix))]
+                        let close_result = lab::close_ready_entry(&entry);
+                        match close_result {
+                            Ok(receipts) => {
+                                for receipt in receipts {
+                                    st.log_bytes += logx::log(
+                                        &self.log_cfg,
+                                        logx::Level::Info,
+                                        "lab.close.stage",
+                                        &format!("pid={} {receipt}", entry.pid),
+                                    )?;
+                                }
                             }
-                        } else {
-                            lab::close_ready_entry(&entry)
-                        };
-                    #[cfg(not(unix))]
-                    let close_result = lab::close_ready_entry(&entry);
-                    match close_result {
-                        Ok(receipts) => {
-                            for receipt in receipts {
+                            Err(error) => {
+                                st.errors += 1;
                                 st.log_bytes += logx::log(
                                     &self.log_cfg,
-                                    logx::Level::Info,
-                                    "lab.close.stage",
-                                    &format!("pid={} {receipt}", entry.pid),
+                                    logx::Level::Warn,
+                                    "lab.close.refused",
+                                    &format!("pid={} reason={error}", entry.pid),
                                 )?;
                             }
-                        }
-                        Err(error) => {
-                            st.errors += 1;
-                            st.log_bytes += logx::log(
-                                &self.log_cfg,
-                                logx::Level::Warn,
-                                "lab.close.refused",
-                                &format!("pid={} reason={error}", entry.pid),
-                            )?;
                         }
                     }
                 }
@@ -880,7 +884,8 @@ impl Observer {
             self.owner_snapshot.retain(|pid, _| visible.contains(pid));
         }
 
-        if !outcome.processes.is_empty()
+        if !PILOT_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+            && !outcome.processes.is_empty()
             && unknown_rows.saturating_mul(2) >= outcome.processes.len()
             && pilot::schedule_deep_targets(
                 &self.deep_scheduler,
@@ -912,6 +917,14 @@ impl Observer {
             )?;
         }
         let usage = stats::self_usage();
+        if PILOT_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+            st.log_bytes += logx::log(
+                &self.log_cfg,
+                logx::Level::Info,
+                "pilot.cycle.record",
+                &format!("appeared_or_changed={} disappeared_or_transitions={} errors={} entries={} rss_kib={} cpu_ticks={} swap_total_kib={} swap_free_kib={} log_growth_bytes={}", st.events, st.transitions, st.errors, st.inspected, usage.rss_kib, usage.cpu_ticks, st.swap_total_kib, st.swap_free_kib, st.log_bytes),
+            )?;
+        }
         st.log_bytes += logx::log(
             &self.log_cfg,
             logx::Level::Info,
@@ -1040,7 +1053,12 @@ fn cmd_close(pid: u32, act: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
+fn cmd_observe(
+    interval: u64,
+    state_dir: &std::path::Path,
+    pilot_read_only: bool,
+) -> io::Result<()> {
+    PILOT_READ_ONLY.store(pilot_read_only, std::sync::atomic::Ordering::Relaxed);
     let _observer_lock = pilot::observer_lock(state_dir)?;
     let log_cfg = logx::LogConfig::new(state_dir.join("logs"));
     let boot_id = identity::read_boot_id();
@@ -1069,6 +1087,9 @@ fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
     logx::log(&log_cfg, logx::Level::Info, "observer.started",
         &format!("read_only=true recovered={kept} discarded_recycled={discarded} pidfd={} interval={interval}",
             identity::pidfd_status()))?;
+    if pilot_read_only {
+        pilot::heartbeat(state_dir, interval, outcome.processes.len())?;
+    }
     logx::enforce_retention(&log_cfg, &{
         let (y, m, d) = logx::civil_date((logx::now_secs() / 86400) as i64);
         format!("{y:04}-{m:02}-{d:02}")
@@ -1089,16 +1110,29 @@ fn cmd_observe(interval: u64, state_dir: &std::path::Path) -> io::Result<()> {
         context_snapshot: HashMap::new(),
         owner_snapshot: HashMap::new(),
     };
+    let mut failures = 0u32;
     loop {
         match obs.cycle() {
             Ok(st) => {
+                failures = 0;
+                if pilot_read_only {
+                    pilot::heartbeat(state_dir, interval, st.inspected)?;
+                }
                 let u = stats::self_usage();
                 println!("{} {}", logx::now_secs(), st.summary(&u));
                 let _ = &obs.usage_start;
             }
-            Err(e) => eprintln!("cycle error (continuing): {e}"),
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                eprintln!("cycle error (continuing): {e}");
+            }
         }
-        thread::sleep(Duration::from_secs(interval));
+        let delay = if failures == 0 {
+            Duration::from_secs(interval)
+        } else {
+            pilot::retry_delay(interval, failures)
+        };
+        thread::sleep(delay);
     }
 }
 
@@ -1192,6 +1226,11 @@ fn main() {
         }
         Some("pilot") => match args.get(2).map(String::as_str) {
             Some("report") => pilot::report_mode(args.iter().any(|a| a == "--deep")),
+            Some("smoke") => args
+                .get(3)
+                .and_then(|s| s.parse::<usize>().ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Usage: pilot smoke N"))
+                .and_then(|n| pilot::smoke(&PathBuf::from(&state_dir), n)),
             Some("metrics") => pilot::metrics(&PathBuf::from(&state_dir)),
             Some("start") => {
                 let interval = args
@@ -1200,14 +1239,14 @@ fn main() {
                     .and_then(|i| args.get(i + 1))
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(30)
-                    .max(5);
+                    .clamp(5, 3600);
                 pilot::start(&PathBuf::from(&state_dir), interval)
             }
             Some("status") => pilot::status(&PathBuf::from(&state_dir)),
             Some("stop") => pilot::stop(&PathBuf::from(&state_dir)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Usage: pilot report|metrics|start|status|stop",
+                "Usage: pilot report|metrics|start|status|stop|smoke N",
             )),
         },
         Some("inspect") => match args.get(2).and_then(|s| s.parse::<u32>().ok()) {
@@ -1220,7 +1259,11 @@ fn main() {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30)
                 .max(5);
-            cmd_observe(seconds, &PathBuf::from(&state_dir))
+            cmd_observe(
+                seconds,
+                &PathBuf::from(&state_dir),
+                args.iter().any(|a| a == "--pilot-read-only"),
+            )
         }
         _ => {
             println!("Reaper v0.2.0-phase2 (observable supervisor, still read-only)");

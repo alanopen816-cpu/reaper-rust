@@ -103,3 +103,31 @@ fn stale_pidfile_is_replaced_and_foreign_pidfile_is_preserved_on_stop() {
     }
     let _ = fs::remove_dir_all(home);
 }
+
+#[test]
+fn pilot_smoke_runs_a_bounded_number_of_read_only_cycles() {
+    let home = isolated_state();
+    let output = invoke(&home, &["pilot", "smoke", "2"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("pilot smoke complete"), "{stdout}");
+    assert!(stdout.contains("cycles=2"), "{stdout}");
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn pilot_source_has_no_wakelock_api_and_read_only_guards_actuation() {
+    let main = fs::read_to_string("src/main.rs").unwrap();
+    let pilot = fs::read_to_string("src/pilot.rs").unwrap();
+    for forbidden in ["WakeLock", "PartialWakeLock", "acquireWakeLock"] {
+        assert!(!main.contains(forbidden), "main.rs contains {forbidden}");
+        assert!(!pilot.contains(forbidden), "pilot.rs contains {forbidden}");
+    }
+    assert!(main.contains("PILOT_READ_ONLY.load"));
+    assert!(main.contains("--pilot-read-only"));
+    assert!(main.contains("!PILOT_READ_ONLY.load") && main.contains("schedule_deep_targets"));
+}
