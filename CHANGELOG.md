@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.9.0-operational-pilot — 2026-10-14 (branch `feature/reaper-v0.9`, base `feature/reaper-v0.8@cb436cc`)
+
+First REAL lab-owned managed service end-to-end (18-step autonomous
+demo incl. reconnect-cancel + new-grace, real 5-min double-grace runs),
+listener-gated coverage entry, 7-day read-only observation pilot
+(running), operational hardening (persistent Emergency Stop, per-service
+scoped auth, fail-closed faults, bounded restart, strict reconstruction),
+read-only TUI Operations view with motor/grace/pilot plumbing.
+Production never closed. 12 rules HOLD; CompleteVerified unattainable
+on this kernel BY DESIGN (listener tables denied).
+
+Benchmarks v0.8 → v0.9 (measured on-device):
+
+| Metric | v0.8 | v0.9 |
+|---|---|---|
+| Fast Scan wall | 30 ms wall, 0 spawns, 0 errors | 19 ms wall, 50 procs observed, read-only |
+| Deep Inspection | bounded 35 s | bounded 35 s (kept) |
+| Tests default / tui | 148 / 165 | 157+16 / 176+16, none deleted |
+| Release default | 1285024 B | 1580720 B (+23%, managed-service + coverage + hardening) |
+| Release tui | 1919952 B | 2226400 B (+16%, ops view + plumbing) |
+| Pilot RSS (observer) | — | 3944 KB VmRSS, pid 15157, ~5 h uptime |
+| Logs/state | rotation/retention/size caps + 1 MiB refusal | 992 KB total, daily JSONL + pilot-observe.log, gap detector live (`missing_cycles` recorded under build load) |
+| Real 5-min graces | — | 300.027 s + 300.001 s monotonic, 18/18 steps ×2, zero strays |
+
+Added:
+- V9-T1 security-debt audit CONDITIONAL-GO (STALE-CARRIED none,
+  cmd_close unsatisfiable fail-closed; poison matrix DROPPED as
+  incoherent — gate takes no carried channel; 2 UNTRACED closed live
+  by the 18-step demo in V9-T2).
+- V9-T2 first real managed service (`managed-service serve` loopback
+  child, ledger, UDS peer-cred attestation lab-only) + 18/18-step
+  autonomous demo incl. reconnect-cancel + new-full-grace; real 5-min
+  double-grace runs (300.027 s + 300.001 s monotonic, sentinel
+  unchanged, zero strays). Pre-listener-gate: mechanism-valid,
+  coverage-unproven (see kernel finding).
+- V9-T3 listener-gated coverage entry (both tables denied on this
+  kernel → Unknown fail-closed) + coverage-entry.md + OpenCode/Codex
+  applicability docs. KERNEL FINDING: exclusive-access proof
+  impossible here → CompleteVerified unattainable → autonomous close
+  blocked BY DESIGN.
+- V9-T4 7-day read-only pilot (heartbeat CLOCK_BOOTTIME, gap
+  detection, capped backoff, rotation, verified-child-only stop);
+  legacy-state fatal fixed via quarantine (7e57612). Running since
+  12:42:42 -05, first `missing_cycles` gap recorded under build load —
+  detector working as designed.
+- V9-T5 hardening (persistent Emergency Stop, per-service scoped
+  auth, fault fail-closed matrix, bounded restart with cap, strict
+  per-close reconstruction schema). Durable-grant artifact →
+  documented residual (no prod closes in v0.9).
+- V9-T6 read-only Operations view + motor/grace/pilot snapshot
+  plumbing (decision-variant counts from existing rows, read-only
+  supervisor.json + heartbeat parsing, honest unavailable labels).
+- V9-T7 validation (fmt/clippy/test/build ×2 green; 157+16 /
+  176+16 tests) + independent audit; 3 gaps founded-STOP to
+  documented residuals (opaque official receipt, no expiry model,
+  empty-scan vacuity) — no scope expansion for results.
+
+Verified: fmt, clippy ×2, tests ×2, release builds ×2 (sizes TBD
+below), real controlled labs, zero strays, production untouched.
+Independent audit: 12 HOLD; T6 read-only confirmed.
+
+Known limits: classic kill() TOCTOU (pidfd preferred); kill en vuelo
+OpenCode missing; grant operador durable residual; uptime_seconds=0
+cosmético; T6 RED honest-gap (compile error, not behavioral RED);
+verifier-noted partials (last-gone, phone-restart, /proc-loss e2e
+pins); linker + TTL flakes (1 retry green); /proc/net denegadas.
+
+Real-pilot conditions: 7 real days read-only without unplanned gaps
+beyond load-starvation; presence signal + human review + RDD before
+any close; CompleteVerified unreachable here by construction —
+production closes need a kernel with readable listener tables + full
+proof + fresh approval + lab membership.
+
 ## v0.8.0-runtime-autonomy — 2026-10-14 (branch `feature/reaper-v0.8`, base `feature/reaper-v0.7@f9dbf34`)
 
 Runtime integration: discovery → classification → evidence → policy →
