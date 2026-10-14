@@ -626,4 +626,60 @@ mod tests {
         assert!(final_close_gate(&child.entry, &fresh, true).is_ok());
         drop(child);
     }
+
+    #[test]
+    fn vanished_live_lab_service_blocks_close_and_persists_refusal() {
+        let _guard = crate::lab::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let registry =
+            std::env::temp_dir().join(format!("reaper-vanish-{}.json", std::process::id()));
+        std::env::set_var("REAPER_LAB_REGISTRY", &registry);
+        let server = crate::lab_coverage::IsolatedServer::bind().unwrap();
+        let address = server.address();
+        let server_thread = thread::spawn(move || server.serve_for(Duration::from_millis(80)));
+        let mut child = crate::lab::spawn(false).unwrap();
+        let entry = child.entry.clone();
+        let result = run_lab_cycle_with_work(
+            &mut child,
+            Duration::from_millis(5),
+            false,
+            crate::evidence::ClientWorkState::IdleVerified {
+                surfaces: vec!["live lab client and work roster".into()],
+            },
+            |_entry| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    match std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20))
+                    {
+                        Ok(_) => thread::sleep(Duration::from_millis(5)),
+                        Err(error) if std::time::Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(5));
+                            if error.kind() == io::ErrorKind::ConnectionRefused {
+                                return Err(io::Error::other(
+                                    "lab service vanished during close revalidation",
+                                ));
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::other(
+                            "lab service did not vanish before timeout",
+                        ));
+                    }
+                }
+            },
+        );
+        server_thread.join().unwrap();
+        assert!(result.is_err(), "a vanished lab service must block close");
+        let receipt = std::fs::read_to_string(crate::lab::receipt_path_current()).unwrap();
+        assert!(receipt.contains("fresh final-gate evidence unavailable"));
+        assert!(receipt.contains("in_progress") || receipt.contains("refused"));
+        drop(child);
+        assert_ne!(
+            crate::lab::identity_ticks(entry.pid).ok(),
+            Some(entry.start_ticks)
+        );
+    }
 }

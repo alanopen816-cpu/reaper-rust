@@ -15,6 +15,8 @@ pub enum Event {
     Request {
         authenticated: bool,
         work_pending: bool,
+        project: String,
+        client: String,
     },
 }
 
@@ -42,6 +44,7 @@ pub struct IsolatedServer {
     events: Arc<Mutex<Vec<Event>>>,
     work_pending: Arc<Mutex<bool>>,
     token: String,
+    project: String,
 }
 
 /// Owns a lab sleeper and records completion on wait. Drop always reaps it.
@@ -105,6 +108,7 @@ impl IsolatedServer {
             events: Arc::new(Mutex::new(Vec::new())),
             work_pending: Arc::new(Mutex::new(false)),
             token: "lab-only-token".into(),
+            project: "default-project".into(),
         })
     }
 
@@ -129,15 +133,24 @@ impl IsolatedServer {
                     let events = events.clone();
                     let work = work.clone();
                     let token = self.token.clone();
+                    let project = self.project.clone();
                     thread::spawn(move || {
                         let mut request = [0u8; 512];
                         let n = stream.read(&mut request).unwrap_or(0);
                         let input = String::from_utf8_lossy(&request[..n]);
                         let authenticated = input.contains(&format!("Authorization: {token}"));
+                        let client = input
+                            .lines()
+                            .find_map(|line| line.strip_prefix("X-Lab-Client: "))
+                            .unwrap_or("unknown")
+                            .trim()
+                            .to_owned();
                         let pending = *work.lock().unwrap();
                         events.lock().unwrap().push(Event::Request {
                             authenticated,
                             work_pending: pending,
+                            project,
+                            client,
                         });
                         let body = if authenticated {
                             format!("work_pending={pending}")
@@ -308,6 +321,98 @@ mod tests {
             .unwrap()
             .invalidate(crate::client_tracker::ProofInvalidation::EventLoss),
             crate::client_tracker::Coverage::Unknown
+        );
+    }
+
+    #[test]
+    fn expired_live_coverage_proof_downgrades_to_unknown() {
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let proof = crate::client_tracker::CoverageProof::issue_verified(
+            vec!["loopback".into()],
+            "ttl-lab-server",
+            issued_at,
+            0,
+            "live loopback lab",
+            "isolated listener only",
+        )
+        .unwrap();
+        let server = IsolatedServer::bind().unwrap();
+        let address = server.address();
+        let worker = thread::spawn(move || server.serve_for(Duration::from_millis(1200)));
+        let response = IsolatedServer::request_from(address, "lab-only-token");
+        assert!(response.unwrap().contains("200 OK"));
+        thread::sleep(Duration::from_millis(1100));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(
+            proof.coverage_for("ttl-lab-server", now),
+            crate::client_tracker::Coverage::Unknown
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn two_live_project_harnesses_keep_clients_and_work_isolated() {
+        let mut project_a = IsolatedServer::bind().unwrap();
+        let mut project_b = IsolatedServer::bind().unwrap();
+        project_a.project = "project-a".into();
+        project_b.project = "project-b".into();
+        project_a.set_work_pending(true);
+        let address_a = project_a.address();
+        let address_b = project_b.address();
+        let events_a = project_a.events.clone();
+        let events_b = project_b.events.clone();
+        let worker_a = thread::spawn(move || project_a.serve_for(Duration::from_millis(300)));
+        let worker_b = thread::spawn(move || project_b.serve_for(Duration::from_millis(300)));
+        let request = |address, client: &str| {
+            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            write!(stream, "GET / HTTP/1.1\r\nAuthorization: lab-only-token\r\nX-Lab-Client: {client}\r\nConnection: close\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let response_a = request(address_a, "client-a");
+        let response_b = request(address_b, "client-b");
+        assert!(response_a.contains("200 OK"));
+        assert!(response_b.contains("200 OK"));
+        assert!(response_a.contains("work_pending=true"));
+        assert!(response_b.contains("work_pending=false"));
+        assert_ne!(address_a, address_b);
+        worker_a.join().unwrap();
+        worker_b.join().unwrap();
+        assert_eq!(
+            events_a.lock().unwrap().as_slice(),
+            &[
+                Event::Connected,
+                Event::Request {
+                    authenticated: true,
+                    work_pending: true,
+                    project: "project-a".into(),
+                    client: "client-a".into()
+                },
+                Event::Disconnected
+            ]
+        );
+        assert_eq!(
+            events_b.lock().unwrap().as_slice(),
+            &[
+                Event::Connected,
+                Event::Request {
+                    authenticated: true,
+                    work_pending: false,
+                    project: "project-b".into(),
+                    client: "client-b".into()
+                },
+                Event::Disconnected
+            ]
         );
     }
 }

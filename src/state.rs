@@ -467,4 +467,57 @@ mod tests {
         assert_eq!(supervisor.state_of(12), None);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn live_lab_grace_elapsed_before_restart_requires_revalidation() {
+        let _guard = crate::lab::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let registry =
+            std::env::temp_dir().join(format!("reaper-live-restart-{}.json", std::process::id()));
+        std::env::set_var("REAPER_LAB_REGISTRY", &registry);
+        let mut child = crate::lab::spawn(false).unwrap();
+        let identity = id(child.entry.pid, child.entry.start_ticks);
+        let dir = std::env::temp_dir().join(format!("reaper-live-reload-{}", std::process::id()));
+        let file = dir.join("state");
+        let issued = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut before_restart = Supervisor::new(file.clone());
+        before_restart.transition(
+            &identity,
+            State::GracePeriod,
+            issued,
+            "lab cycle",
+            "lab-project",
+            "revalidate",
+        );
+        before_restart.arm_grace(identity.pid, issued + 1);
+        before_restart.persist().unwrap();
+        let cycle =
+            crate::lab::run_lab_cycle(&mut child, std::time::Duration::from_millis(1100), true)
+                .unwrap();
+        assert_eq!(cycle.outcome, crate::lab::Outcome::Cancelled);
+        let live: HashMap<u32, ProcessIdentity> =
+            [(identity.pid, identity.clone())].into_iter().collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut after_restart = Supervisor::new(file.clone());
+        let (kept, discarded) = after_restart.reload(&live, now, 600, &file).unwrap();
+        assert_eq!((kept, discarded), (1, 0));
+        assert_eq!(
+            after_restart.state_of(identity.pid),
+            Some(State::GracePeriod)
+        );
+        assert!(!after_restart.grace_expired(identity.pid, now + 599));
+        drop(child);
+        assert_ne!(
+            crate::lab::identity_ticks(identity.pid).ok(),
+            Some(identity.start_ticks)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

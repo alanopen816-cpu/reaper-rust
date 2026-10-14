@@ -2,6 +2,8 @@
 #[path = "lab_autonomy.rs"]
 mod autonomy;
 pub use autonomy::close_ready_entry;
+#[cfg(test)]
+pub use autonomy::{run_lab_cycle, Outcome};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
