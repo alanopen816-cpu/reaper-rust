@@ -135,9 +135,21 @@ impl IsolatedServer {
                     let token = self.token.clone();
                     let project = self.project.clone();
                     thread::spawn(move || {
-                        let mut request = [0u8; 512];
-                        let n = stream.read(&mut request).unwrap_or(0);
-                        let input = String::from_utf8_lossy(&request[..n]);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while request.len() < 4096 {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    request.extend_from_slice(&chunk[..n]);
+                                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let input = String::from_utf8_lossy(&request);
                         let authenticated = input.contains(&format!("Authorization: {token}"));
                         let client = input
                             .lines()
@@ -199,6 +211,30 @@ impl IsolatedServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragmented_request_headers_are_observed_completely() {
+        let server = IsolatedServer::bind().unwrap();
+        let address = server.address();
+        let events = server.events.clone();
+        let worker = thread::spawn(move || server.serve_for(Duration::from_millis(250)));
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nAuthorization: lab-only-token\r\n")
+            .unwrap();
+        thread::sleep(Duration::from_millis(30));
+        client
+            .write_all(b"X-Lab-Client: fragmented-client\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        worker.join().unwrap();
+        assert!(response.contains("200 OK"));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            Event::Request { client, .. } if client == "fragmented-client"
+        )));
+    }
 
     #[test]
     fn loopback_lab_exercises_supported_scenarios_and_marks_remaining_gaps() {

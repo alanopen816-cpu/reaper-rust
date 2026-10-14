@@ -78,6 +78,51 @@ fn start_ticks(pid: u32) -> io::Result<u64> {
         .map_err(|_| io::Error::other("invalid process start ticks"))
 }
 
+fn tcp_table_has_listener(table: &str) -> bool {
+    table
+        .lines()
+        .skip(1)
+        .any(|line| line.split_whitespace().nth(3) == Some("0A"))
+}
+
+fn tcp_listener_present() -> io::Result<bool> {
+    let table = std::fs::read_to_string("/proc/self/net/tcp")
+        .or_else(|_| std::fs::read_to_string("/proc/net/tcp"))?;
+    Ok(tcp_table_has_listener(&table))
+}
+
+#[cfg(test)]
+mod tcp_listener_tests {
+    use super::*;
+
+    #[test]
+    fn tcp_listener_table_parser_detects_listen_state() {
+        let table = "  sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345\n   1: 0100007F:1F91 00000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 12346\n";
+        assert!(tcp_table_has_listener(table));
+        assert!(!tcp_table_has_listener("header\n"));
+    }
+
+    #[test]
+    fn live_tcp_table_readability_matches_selected_fallback_and_listener_probe() {
+        let self_net = std::fs::read_to_string("/proc/self/net/tcp");
+        let proc_net = std::fs::read_to_string("/proc/net/tcp");
+        let expected = self_net.as_ref().ok().or(proc_net.as_ref().ok());
+        match expected {
+            Some(table) => assert_eq!(
+                tcp_listener_present().unwrap(),
+                tcp_table_has_listener(table)
+            ),
+            None => assert!(tcp_listener_present().is_err()),
+        }
+    }
+
+    #[test]
+    fn listener_fixture_invalidates_listener_gate() {
+        let listener_table = "header\n0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345\n";
+        assert!(tcp_table_has_listener(listener_table));
+    }
+}
+
 #[cfg(unix)]
 fn process_state(pid: u32) -> io::Result<char> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -473,9 +518,17 @@ pub fn serve_uds() -> io::Result<()> {
                                 .get(pid)
                                 .is_some_and(|(peer_uid, _, _)| peer_uid == uid)
                     });
-                    // This listener mode creates no TCP socket; the disabled bit
-                    // is explicit evidence for the attestation window.
-                    let tcp_disabled = true;
+                    let tcp_disabled = match tcp_listener_present() {
+                        Ok(false) => true,
+                        Ok(true) => {
+                            eprintln!("lab attestation downgraded: TCP LISTEN socket observed");
+                            false
+                        }
+                        Err(error) => {
+                            eprintln!("lab attestation downgraded: TCP listener tables unreadable: {error}");
+                            false
+                        }
+                    };
                     let attested =
                         all_peers_verified && registered_valid && secure_path && tcp_disabled;
                     format!(
@@ -618,6 +671,19 @@ pub(crate) fn attest_lab_service(
     let server_path_secure = fields[6] == "1";
     let owner_active = fields[7] == "1";
     let tcp_disabled = fields[8] == "1";
+    let tcp_disabled = match tcp_listener_present() {
+        Ok(false) => tcp_disabled,
+        Ok(true) => {
+            eprintln!("lab attestation downgraded: TCP LISTEN socket observed at observer");
+            false
+        }
+        Err(error) => {
+            eprintln!(
+                "lab attestation downgraded: observer cannot read TCP listener tables: {error}"
+            );
+            false
+        }
+    };
     let coverage = if path_secure && peer_population_verified && server_path_secure && tcp_disabled
     {
         crate::client_tracker::Coverage::CompleteVerified
