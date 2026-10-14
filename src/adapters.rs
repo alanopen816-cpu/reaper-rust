@@ -575,17 +575,28 @@ pub struct CodexProbe {
 }
 
 impl CodexProbe {
-    pub fn assess_deep(&self) -> ClientWorkState {
-        self.assess()
+    pub fn assess_deep_with_budget(
+        &self,
+        budget: std::time::Duration,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> ClientWorkState {
+        self.assess_with_budget(budget, cancelled)
     }
+    #[cfg(test)]
     pub fn assess(&self) -> ClientWorkState {
-        crate::queries::count_auxiliary_spawn();
-        let output = std::process::Command::new("codex")
-            .args(["app-server", "daemon", "version"])
-            .output();
-        if !output.is_ok_and(|o| o.status.success()) {
+        self.assess_deep_with_budget(
+            std::time::Duration::from_secs(5),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    pub fn assess_with_budget(
+        &self,
+        budget: std::time::Duration,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> ClientWorkState {
+        if crate::queries::codex_version_with_budget(budget, cancelled).is_err() {
             return ClientWorkState::Error {
-                note: "codex daemon version query failed".into(),
+                note: "codex daemon version query failed or timed out".into(),
             };
         }
         let home = self

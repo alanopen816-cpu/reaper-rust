@@ -207,9 +207,17 @@ pub fn report_mode(deep: bool) -> io::Result<()> {
 }
 
 const DEEP_TIMEOUT: Duration = Duration::from_secs(35);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DEEP_WORKERS: usize = 2;
 fn deep_inspect(rows: &mut [Candidate], metrics: &mut InspectionMetrics) {
-    let started = Instant::now();
+    deep_inspect_with_budget(rows, metrics, DEEP_TIMEOUT);
+}
+
+fn deep_inspect_with_budget(
+    rows: &mut [Candidate],
+    metrics: &mut InspectionMetrics,
+    budget: Duration,
+) {
     let processes = procfs::scan().processes;
     let targets: Vec<_> = rows
         .iter()
@@ -220,8 +228,55 @@ fn deep_inspect(rows: &mut [Candidate], metrics: &mut InspectionMetrics) {
             })
         })
         .collect();
+    deep_inspect_targets_with_budget(rows, metrics, budget, targets);
+}
+
+fn deep_inspect_targets_with_budget(
+    rows: &mut [Candidate],
+    metrics: &mut InspectionMetrics,
+    budget: Duration,
+    targets: Vec<(u32, String)>,
+) {
+    deep_inspect_targets_with_probe(
+        rows,
+        metrics,
+        budget,
+        targets,
+        |name, remaining, cancelled| {
+            if name == "opencode" {
+                crate::adapters::OpenCodeProbe {
+                    base_url: None,
+                    password: None,
+                }
+                .assess_deep()
+            } else {
+                crate::adapters::CodexProbe { sock_path: None }
+                    .assess_deep_with_budget(QUERY_TIMEOUT.min(remaining), &cancelled)
+            }
+        },
+    );
+}
+
+fn deep_inspect_targets_with_probe(
+    rows: &mut [Candidate],
+    metrics: &mut InspectionMetrics,
+    budget: Duration,
+    targets: Vec<(u32, String)>,
+    probe: impl Fn(
+            String,
+            Duration,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> evidence::ClientWorkState
+        + Send
+        + Sync
+        + 'static,
+) {
+    let probe = std::sync::Arc::new(probe);
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Instant::now();
+    let deadline = started.checked_add(budget).unwrap_or(started);
     for batch in targets.chunks(MAX_DEEP_WORKERS) {
-        if started.elapsed() >= DEEP_TIMEOUT {
+        if Instant::now() >= deadline {
             for (pid, name) in batch {
                 mark_unknown(rows, *pid, format!("{name} inspection timeout"));
             }
@@ -229,27 +284,24 @@ fn deep_inspect(rows: &mut [Candidate], metrics: &mut InspectionMetrics) {
             metrics.codex.timeouts += batch.iter().filter(|(_, n)| n == "codex").count();
             continue;
         }
-        let batch_started = Instant::now();
         let handles: Vec<_> = batch
             .iter()
             .map(|(pid, name)| {
                 let (pid, name) = (*pid, name.clone());
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let cancelled = cancelled.clone();
+                let probe = probe.clone();
                 thread::spawn(move || {
-                    let state = if name == "opencode" {
-                        crate::adapters::OpenCodeProbe {
-                            base_url: None,
-                            password: None,
-                        }
-                        .assess_deep()
-                    } else {
-                        crate::adapters::CodexProbe { sock_path: None }.assess_deep()
-                    };
+                    let state = probe(name.clone(), remaining, cancelled);
                     (pid, name, state)
                 })
             })
             .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
         for ((pid, name), handle) in batch.iter().zip(handles) {
-            if batch_started.elapsed() >= DEEP_TIMEOUT {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
                 mark_unknown(rows, *pid, format!("{name} inspection timeout"));
                 if name == "opencode" {
                     metrics.opencode.timeouts += 1;
@@ -259,7 +311,25 @@ fn deep_inspect(rows: &mut [Candidate], metrics: &mut InspectionMetrics) {
                 drop(handle);
                 continue;
             }
-            if let Ok((pid, name, state)) = handle.join() {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let _ = tx.send(handle.join());
+            });
+            let result = match rx.recv_timeout(remaining) {
+                Ok(Ok(result)) => result,
+                _ => {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    mark_unknown(rows, *pid, format!("{name} inspection timeout"));
+                    if name == "opencode" {
+                        metrics.opencode.timeouts += 1;
+                    } else {
+                        metrics.codex.timeouts += 1;
+                    }
+                    continue;
+                }
+            };
+            {
+                let (pid, name, state) = result;
                 let metric = if name == "opencode" {
                     &mut metrics.opencode
                 } else {
@@ -559,5 +629,33 @@ mod tests {
     #[test]
     fn bounded_deep_worker_count_is_fixed() {
         assert_eq!(MAX_DEEP_WORKERS, 2);
+    }
+
+    #[test]
+    fn tiny_deep_budget_returns_unknown_within_bound() {
+        let mut rows = vec![Candidate {
+            pid: std::process::id(),
+            tier: Tier::Unknown,
+            decision: "Blocked".into(),
+            evidence: vec!["client_work=Unknown { missing: [deferred] }".into()],
+            limitations: vec![],
+        }];
+        let started = Instant::now();
+        let mut metrics = InspectionMetrics::default();
+        deep_inspect_targets_with_probe(
+            &mut rows,
+            &mut metrics,
+            Duration::from_millis(20),
+            vec![(std::process::id(), "codex".into())],
+            |_, _, _| {
+                thread::sleep(Duration::from_secs(1));
+                evidence::ClientWorkState::WorkAbsent {
+                    note: "late result".into(),
+                }
+            },
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(rows[0].evidence.iter().any(|e| e.contains("Unknown")));
+        assert!(!rows[0].evidence.iter().any(|e| e.contains("WorkAbsent")));
     }
 }

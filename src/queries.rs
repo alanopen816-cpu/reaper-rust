@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,14 +55,16 @@ pub fn codex_db_counts(codex_home: &str) -> Result<(i64, i64, i64), String> {
 }
 
 fn sqlite_count(path: &str, sql: &str) -> Result<i64, String> {
-    AUX_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uri = format!("file:{path}?mode=ro");
-    let mut child = Command::new("sqlite3")
+    let mut command = Command::new("sqlite3");
+    command
         .arg("-readonly")
         .arg(uri)
         .arg(sql)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    count_auxiliary_spawn();
+    let mut child = command
         .spawn()
         .map_err(|e| format!("sqlite3 spawn failed for {path}: {e}"))?;
     let started = Instant::now();
@@ -184,7 +187,7 @@ fn add_endpoint<'a>(
 }
 
 fn run_opencode_command(command: &mut Command, timeout: Duration) -> Result<String, String> {
-    AUX_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_auxiliary_spawn();
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -214,6 +217,34 @@ fn run_opencode_command(command: &mut Command, timeout: Duration) -> Result<Stri
     let _ = child.kill();
     let _ = child.wait();
     Err("OpenCode query timed out or could not be polled".into())
+}
+
+/// Run a Codex query under an end-to-end budget, polling and killing its direct child.
+pub fn codex_version_with_budget(timeout: Duration, cancelled: &AtomicBool) -> Result<(), String> {
+    let mut command = Command::new("codex");
+    command
+        .args(["app-server", "daemon", "version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    count_auxiliary_spawn();
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("codex daemon version query failed: {e}"))?;
+    let started = Instant::now();
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) || started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("codex daemon version query timed out".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) | Err(_) => return Err("codex daemon version query failed".into()),
+            Ok(None) => thread::sleep(
+                Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())),
+            ),
+        }
+    }
 }
 
 pub fn http_get(base_url: &str, password: &str, path: &str) -> Result<String, String> {
@@ -275,7 +306,7 @@ fn validate_loopback(url: &str) -> Result<(), String> {
 }
 
 fn run_curl(command: &mut Command, config: &[u8]) -> Result<String, String> {
-    AUX_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_auxiliary_spawn();
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
