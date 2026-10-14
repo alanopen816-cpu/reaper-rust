@@ -65,6 +65,49 @@ struct ServiceState {
 }
 type Ledger = Arc<Mutex<ServiceState>>;
 
+fn spawn_service_process() -> io::Result<std::process::Child> {
+    let executable = std::env::current_exe()?;
+    let mut command = std::process::Command::new(executable);
+    #[cfg(test)]
+    if std::env::var_os("REAPER_TEST_SERVICE_CHILD").is_some() {
+        command.args([
+            "--exact",
+            "managed_service::restart_tests::serve_uds_child",
+            "--nocapture",
+        ]);
+        command.env("REAPER_TEST_SERVE_UDS", "1");
+    } else {
+        command.args(["managed-service", "serve-uds"]);
+    }
+    #[cfg(not(test))]
+    command.args(["managed-service", "serve-uds"]);
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+fn read_service_readiness(
+    child: &mut std::process::Child,
+    socket: &std::path::Path,
+) -> io::Result<()> {
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("restart readiness unavailable"))?;
+    let mut reader = std::io::BufReader::new(output);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(io::Error::other("service exited before readiness"));
+        }
+        if line.trim() == format!("UDS {}", socket.display()) {
+            return Ok(());
+        }
+    }
+}
+
 /// Explicit retry budget for a service registered as managed. Each successful
 /// request consumes one slot; callers must sleep for the returned backoff.
 #[allow(dead_code)]
@@ -95,6 +138,16 @@ impl RestartBudget {
         if self.used >= self.cap {
             return Err(io::Error::other("managed restart retry cap reached"));
         }
+        if self.used > 0 {
+            let multiplier = 1u32
+                .checked_shl(self.used.saturating_sub(1).min(16))
+                .unwrap_or(u32::MAX);
+            thread::sleep(
+                self.base
+                    .saturating_mul(multiplier)
+                    .min(Duration::from_secs(300)),
+            );
+        }
         self.used += 1;
         restart(self.used)?;
         let multiplier = 1u32
@@ -105,6 +158,124 @@ impl RestartBudget {
             .saturating_mul(multiplier)
             .min(Duration::from_secs(300)))
     }
+
+    pub(crate) fn remaining(&self) -> u32 {
+        self.cap.saturating_sub(self.used)
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum RestartError {
+    NotManaged,
+    Unauthorized,
+    AlreadyRunning,
+    RefusedAtCap,
+    InvalidService,
+    Io(io::Error),
+}
+
+#[allow(dead_code)]
+pub(crate) struct RestartedManagedService {
+    pub entry: crate::lab::Entry,
+    pub child: std::process::Child,
+    pub backoff: Duration,
+}
+
+/// Restart only a stopped, still-registered lab UDS service. Durable operator
+/// grants remain a documented residual; v0.9 has no production close authority.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn restart_managed_service(
+    entry: &crate::lab::Entry,
+    socket: &std::path::Path,
+    emergency_stop_file: &std::path::Path,
+    authorization: &crate::terminate::ScopedAuthorization,
+    budget: &mut RestartBudget,
+) -> Result<RestartedManagedService, RestartError> {
+    use std::os::unix::fs::FileTypeExt;
+    if budget.remaining() == 0 {
+        let _ = crate::lab::persist_close_receipt(
+            entry,
+            &["restart refused: RefusedAtCap".into()],
+            "RefusedAtCap",
+        );
+        return Err(RestartError::RefusedAtCap);
+    }
+    if crate::state::EmergencyStop::is_engaged_at(emergency_stop_file).map_err(RestartError::Io)? {
+        return Err(RestartError::Unauthorized);
+    }
+    let registered = crate::lab::registry_contains(entry).map_err(RestartError::Io)?;
+    if !registered {
+        return Err(RestartError::NotManaged);
+    }
+    let service_id = format!("{}:{}", entry.pid, entry.start_ticks);
+    let expected = crate::terminate::close_scope(
+        &service_id,
+        &crate::lab::registry_path_current().display().to_string(),
+        "reaper-lab",
+    );
+    if !authorization.authorizes(&expected) {
+        return Err(RestartError::Unauthorized);
+    }
+    let journal = std::env::var_os("REAPER_LAB_SERVICE_JOURNAL")
+        .map(std::path::PathBuf::from)
+        .ok_or(RestartError::InvalidService)?;
+    let journal_contents = std::fs::read_to_string(journal).map_err(RestartError::Io)?;
+    if !journal_contents.contains(&format!("\"event\":\"uds_started\",\"pid\":{}", entry.pid)) {
+        return Err(RestartError::InvalidService);
+    }
+    match std::fs::symlink_metadata(socket) {
+        Ok(metadata) if metadata.file_type().is_socket() => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        _ => return Err(RestartError::InvalidService),
+    }
+    if start_ticks(entry.pid).ok() == Some(entry.start_ticks)
+        && process_state(entry.pid).ok() != Some('Z')
+    {
+        return Err(RestartError::AlreadyRunning);
+    }
+    match std::fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(RestartError::Io(error)),
+    }
+    let mut created = None;
+    let backoff = budget
+        .restart(true, true, |_| {
+            if crate::state::EmergencyStop::is_engaged_at(emergency_stop_file)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "emergency stop engaged",
+                ));
+            }
+            let mut child = spawn_service_process()?;
+            if let Err(error) = read_service_readiness(&mut child, socket) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            let next = crate::lab::current_registry()?
+                .into_iter()
+                .find(|candidate| candidate.pid == child.id())
+                .ok_or_else(|| io::Error::other("restarted service did not register"))?;
+            created = Some((child, next));
+            Ok(())
+        })
+        .map_err(|error| {
+            if error.to_string().contains("retry cap") {
+                RestartError::RefusedAtCap
+            } else {
+                RestartError::Io(error)
+            }
+        })?;
+    let (child, entry) =
+        created.ok_or_else(|| RestartError::Io(io::Error::other("restart produced no child")))?;
+    Ok(RestartedManagedService {
+        entry,
+        child,
+        backoff,
+    })
 }
 
 fn start_ticks(pid: u32) -> io::Result<u64> {
@@ -199,6 +370,134 @@ mod tcp_listener_tests {
     fn listener_fixture_invalidates_listener_gate() {
         let listener_table = "header\n0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345\n";
         assert!(tcp_table_has_listener(listener_table));
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    #[test]
+    fn serve_uds_child() {
+        if std::env::var_os("REAPER_TEST_SERVE_UDS").is_some() {
+            serve_uds().unwrap();
+        }
+    }
+
+    #[test]
+    fn live_restart_consumes_budget_and_rejects_non_managed_targets() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::lab::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "reaper-managed-restart-{}-{}",
+            std::process::id(),
+            crate::logx::now_secs()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = root.join("lab.json");
+        let socket = root.join("service.sock");
+        let journal = root.join("service.jsonl");
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            [
+                "REAPER_TEST_SERVICE_CHILD",
+                "REAPER_LAB_REGISTRY",
+                "REAPER_LAB_SERVICE_SOCKET",
+                "REAPER_LAB_SERVICE_JOURNAL",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        std::env::set_var("REAPER_TEST_SERVICE_CHILD", "1");
+        std::env::set_var("REAPER_LAB_REGISTRY", &registry);
+        std::env::set_var("REAPER_LAB_SERVICE_SOCKET", &socket);
+        std::env::set_var("REAPER_LAB_SERVICE_JOURNAL", &journal);
+
+        let spawn = || {
+            let mut child = spawn_service_process().unwrap();
+            read_service_readiness(&mut child, &socket).unwrap();
+            child
+        };
+        let mut first = spawn();
+        let entry = crate::lab::current_registry()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.pid == first.id())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !std::fs::read_to_string(&journal)
+            .unwrap_or_default()
+            .contains(&format!("\"event\":\"uds_started\",\"pid\":{}", entry.pid))
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        first.kill().unwrap();
+        first.wait().unwrap();
+        let scope = crate::terminate::close_scope(
+            &format!("{}:{}", entry.pid, entry.start_ticks),
+            &registry.display().to_string(),
+            "reaper-lab",
+        );
+        let authorization =
+            crate::terminate::ScopedAuthorization::new(scope, "operator-approved".into());
+        let mut budget = RestartBudget::new(1, Duration::from_secs(1));
+        let stop_file = root.join("emergency-stop");
+        let mut restarted =
+            restart_managed_service(&entry, &socket, &stop_file, &authorization, &mut budget)
+                .unwrap();
+        assert_eq!(budget.remaining(), 0);
+        assert_eq!(
+            start_ticks(restarted.entry.pid).ok(),
+            Some(restarted.entry.start_ticks)
+        );
+        assert!(matches!(
+            restart_managed_service(
+                &restarted.entry,
+                &socket,
+                &stop_file,
+                &authorization,
+                &mut budget
+            ),
+            Err(RestartError::RefusedAtCap)
+        ));
+        assert!(std::fs::read_to_string(crate::lab::receipt_path_current())
+            .unwrap()
+            .contains("RefusedAtCap"));
+        let unmanaged = crate::lab::Entry {
+            pid: u32::MAX,
+            start_ticks: 1,
+            spawned_at: 1,
+        };
+        let mut non_managed_budget = RestartBudget::new(1, Duration::from_millis(1));
+        assert!(matches!(
+            restart_managed_service(
+                &unmanaged,
+                &socket,
+                &stop_file,
+                &authorization,
+                &mut non_managed_budget
+            ),
+            Err(RestartError::NotManaged)
+        ));
+        restarted.child.kill().unwrap();
+        let _ = restarted.child.wait();
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -895,8 +1194,16 @@ pub(crate) fn revalidate_for_close(
 pub(crate) fn close_ready_service(
     entry: &crate::lab::Entry,
     socket: &std::path::Path,
+    grace_started_at: u64,
+    emergency_stop_file: &std::path::Path,
 ) -> io::Result<Vec<String>> {
     use crate::terminate::{ClosePolicy, LabRecord, PidfdSignaller};
+    if crate::state::EmergencyStop::is_engaged_at(emergency_stop_file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "emergency stop engaged before managed close",
+        ));
+    }
     let authorization = crate::lab::authorization_for(
         entry,
         format!("fresh-approval:{}:{}", entry.pid, entry.start_ticks),
@@ -939,6 +1246,63 @@ pub(crate) fn close_ready_service(
         "mechanism=managed-service-uds-official-shutdown+pidfd-term".into(),
     ];
     crate::lab::persist_close_receipt(entry, &audit, "in_progress")?;
+    let audit_record =
+        |outcome: &str, mechanism: String, errors: Vec<String>| crate::lab::CloseAuditRecord {
+            identity: format!(
+                "pid:{};start_ticks:{};spawned_at:{}",
+                entry.pid, entry.start_ticks, entry.spawned_at
+            ),
+            evidence_refs: vec![
+                format!("procfs-scan:{}:{}", entry.pid, entry.start_ticks),
+                format!(
+                    "service-attestation:{}:{}:{}",
+                    entry.pid,
+                    entry.start_ticks,
+                    crate::logx::now_secs()
+                ),
+            ],
+            policy_id: "managed-lab-close".into(),
+            policy_version: "1".into(),
+            authorization_scope: format!(
+                "service={}:{};registry={};project=reaper-lab",
+                entry.pid,
+                entry.start_ticks,
+                crate::lab::registry_path_current().display()
+            ),
+            approval_refs: vec![authorization.fresh_approval_ref.clone()],
+            grace_started_at,
+            grace_ended_at: crate::logx::now_secs(),
+            revalidation_results: format!(
+                "identity={};coverage={};idle_work={};policy={};proven={}",
+                report.identity, report.coverage, report.idle_work, report.policy, report.proven
+            ),
+            mechanism,
+            outcome: outcome.into(),
+            errors,
+            timestamp: crate::logx::now_secs(),
+        };
+    crate::lab::append_close_audit(
+        &crate::lab::close_audit_path_current(),
+        &audit_record(
+            "in_progress",
+            "UDS official shutdown with pidfd fallback available".into(),
+            Vec::new(),
+        ),
+    )?;
+    if crate::state::EmergencyStop::is_engaged_at(emergency_stop_file)? {
+        crate::lab::append_close_audit(
+            &crate::lab::close_audit_path_current(),
+            &audit_record(
+                "refused",
+                "emergency stop prevented actuation".into(),
+                vec!["emergency stop engaged".into()],
+            ),
+        )?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "emergency stop engaged before managed actuation",
+        ));
+    }
     let record = LabRecord {
         pid: entry.pid,
         start_ticks: entry.start_ticks,
@@ -980,6 +1344,11 @@ pub(crate) fn close_ready_service(
     if crate::lab::identity_ticks(entry.pid).ok() == Some(entry.start_ticks)
         && process_state(entry.pid).ok() != Some('Z')
     {
+        let errors = receipts.clone();
+        crate::lab::append_close_audit(
+            &crate::lab::close_audit_path_current(),
+            &audit_record("failed", format!("close sequence: {receipts:?}"), errors),
+        )?;
         crate::lab::persist_close_receipt(entry, &receipts, "official close did not stop service")?;
         return Err(io::Error::other(format!(
             "service remained after official shutdown: {receipts:?}"
@@ -989,11 +1358,24 @@ pub(crate) fn close_ready_service(
         .iter()
         .any(|receipt| receipt.starts_with("TERM:") || receipt.starts_with("KILL:"))
     {
+        let errors = receipts.clone();
+        crate::lab::append_close_audit(
+            &crate::lab::close_audit_path_current(),
+            &audit_record("failed", format!("close sequence: {receipts:?}"), errors),
+        )?;
         crate::lab::persist_close_receipt(entry, &receipts, "service required signal close")?;
         return Err(io::Error::other(format!(
             "official endpoint failed before signal close: {receipts:?}"
         )));
     }
+    crate::lab::append_close_audit(
+        &crate::lab::close_audit_path_current(),
+        &audit_record(
+            "closed",
+            format!("close sequence: {receipts:?}"),
+            Vec::new(),
+        ),
+    )?;
     crate::lab::persist_close_receipt(entry, &receipts, "closed")?;
     Ok(receipts)
 }
@@ -1258,7 +1640,7 @@ pub fn run_demo(grace_secs: u64) -> io::Result<()> {
         context_snapshot: std::collections::HashMap::new(),
         owner_snapshot: std::collections::HashMap::new(),
         emergency_stop_file: root.join("emergency-stop"),
-        recovery_faulted: false,
+        startup_fault: None,
     };
     observer.cycle()?;
     if observer.supervisor.state_of(entry.pid) != Some(crate::state::State::Observing) {

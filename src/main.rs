@@ -336,7 +336,7 @@ struct Observer {
     context_snapshot: HashMap<u32, (identity::ProcessIdentity, u32, u32)>,
     owner_snapshot: HashMap<u32, (identity::ProcessIdentity, String)>,
     emergency_stop_file: PathBuf,
-    recovery_faulted: bool,
+    startup_fault: Option<state::OperationalFault>,
 }
 
 static PILOT_READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -366,7 +366,10 @@ impl Observer {
         let uid = own_uid();
         let now = logx::now_secs();
         let emergency_stop = state::EmergencyStop::is_engaged_at(&self.emergency_stop_file)?;
-        let faulted = self.recovery_faulted || outcome.skipped_stat + outcome.skipped_mismatch > 0;
+        let scan_fault = (outcome.skipped_stat + outcome.skipped_mismatch > 0)
+            .then_some(state::OperationalFault::Procfs);
+        let startup_fault = self.startup_fault.or(scan_fault);
+        let faulted = !state::auto_action_initiation_allowed(startup_fault);
 
         let durable_before = self.supervisor.identity_snapshot();
         let durable_now: Vec<_> = outcome
@@ -740,10 +743,32 @@ impl Observer {
                 &signals,
                 &[],
             );
-            if emergency_stop || faulted {
+            let process_fault = if owner_active.is_none() {
+                Some(state::OperationalFault::Connectivity)
+            } else if coverage != client_tracker::Coverage::CompleteVerified {
+                Some(state::OperationalFault::UnverifiableClients)
+            } else if current == Some(State::GracePeriod) && !evidence::candidate_for_grace(&ev) {
+                Some(state::OperationalFault::StaleEvidence)
+            } else {
+                startup_fault
+            };
+            let action_candidate = matches!(
+                &decision,
+                Decision::GraceCandidate { .. } | Decision::ReadyForRevalidation { .. }
+            ) || matches!(
+                current,
+                Some(State::GracePeriod | State::ReadyForRevalidation)
+            );
+            if action_candidate && (emergency_stop || faulted || process_fault.is_some()) {
                 decision = Decision::Blocked {
                     reason: if emergency_stop {
                         "emergency stop engaged".into()
+                    } else if process_fault == Some(state::OperationalFault::Connectivity) {
+                        "adapter connectivity lost; automatic action blocked".into()
+                    } else if process_fault == Some(state::OperationalFault::UnverifiableClients) {
+                        "client evidence unverifiable; automatic action blocked".into()
+                    } else if process_fault == Some(state::OperationalFault::StaleEvidence) {
+                        "grace evidence stale; automatic action blocked".into()
                     } else {
                         "operational evidence fault; automatic action blocked".into()
                     },
@@ -771,6 +796,7 @@ impl Observer {
                 };
                 if !PILOT_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
                     && state::grace_start_allowed(emergency_stop, faulted)
+                    && state::auto_action_initiation_allowed(process_fault)
                 {
                     if let Some(entry) = lab::current_registry()?
                         .into_iter()
@@ -781,7 +807,17 @@ impl Observer {
                             if let Some(socket) = std::env::var_os("REAPER_LAB_SERVICE_SOCKET") {
                                 let socket = std::path::PathBuf::from(socket);
                                 if managed_service::attest_lab_service(&entry, &socket).is_ok() {
-                                    managed_service::close_ready_service(&entry, &socket)
+                                    match self.supervisor.grace_started_at(p.pid) {
+                                        Some(started_at) => managed_service::close_ready_service(
+                                            &entry,
+                                            &socket,
+                                            started_at,
+                                            &self.emergency_stop_file,
+                                        ),
+                                        None => Err(io::Error::other(
+                                            "grace start timestamp missing; close refused",
+                                        )),
+                                    }
                                 } else {
                                     lab::close_ready_entry(&entry)
                                 }
@@ -812,12 +848,25 @@ impl Observer {
                             }
                         }
                     }
+                } else if !PILOT_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(entry) = lab::current_registry()?
+                        .into_iter()
+                        .find(|entry| entry.pid == p.pid && entry.start_ticks == p.start_ticks)
+                    {
+                        let reason = if emergency_stop {
+                            "emergency stop engaged".to_owned()
+                        } else {
+                            format!("automatic close blocked by fault: {process_fault:?}")
+                        };
+                        lab::persist_close_receipt(&entry, std::slice::from_ref(&reason), &reason)?;
+                    }
                 }
             }
             // Rescue during grace: owner evidence flipped back while we hold a
             // deadline — cancel explicitly and say so.
             if current == Some(State::GracePeriod)
-                && !matches!(decision, Decision::GraceCandidate { .. })
+                && (!state::inflight_grace_allowed(process_fault)
+                    || !matches!(decision, Decision::GraceCandidate { .. }))
             {
                 let t = self.supervisor.transition(
                     &id,
@@ -886,7 +935,7 @@ impl Observer {
                         Decision::GraceCandidate { grace_secs, .. } => *grace_secs,
                         _ => self.policy.grace_known_secs,
                     };
-                    self.supervisor.arm_grace(p.pid, now + grace);
+                    self.supervisor.arm_grace_at(p.pid, now, now + grace);
                 }
             }
         }
@@ -1045,6 +1094,10 @@ fn cmd_close(pid: u32, act: bool) -> io::Result<()> {
         println!("close receipt: refused; fresh policy approval unavailable; no signal");
         return Ok(());
     };
+    if state::EmergencyStop::is_engaged_at(&logx::default_state_dir().join("emergency-stop"))? {
+        println!("close receipt: refused; emergency stop engaged before actuation; no signal");
+        return Ok(());
+    }
     let mut s = terminate::PidfdSignaller;
     for receipt in terminate::close_sequence(
         &rec,
@@ -1118,7 +1171,13 @@ fn cmd_observe(
     } else {
         false
     };
-    let recovery_faulted = supervisor.recovery_message().is_some() || restart_faulted;
+    let startup_fault = if supervisor.recovery_message().is_some() {
+        Some(state::OperationalFault::CorruptState)
+    } else if restart_faulted {
+        Some(state::OperationalFault::UnexpectedRestart)
+    } else {
+        None
+    };
     let usage_start = stats::self_usage();
     logx::log(&log_cfg, logx::Level::Info, "observer.started",
         &format!("read_only=true recovered={kept} discarded_recycled={discarded} pidfd={} interval={interval}",
@@ -1143,7 +1202,7 @@ fn cmd_observe(
         context_snapshot: HashMap::new(),
         owner_snapshot: HashMap::new(),
         emergency_stop_file: state_dir.join("emergency-stop"),
-        recovery_faulted,
+        startup_fault,
     };
     let mut failures = 0u32;
     loop {
@@ -1454,7 +1513,7 @@ mod pilot_gap_tests {
             context_snapshot: HashMap::new(),
             owner_snapshot: HashMap::new(),
             emergency_stop_file: std::env::temp_dir().join("reaper-test-no-estop"),
-            recovery_faulted: false,
+            startup_fault: None,
         };
         (obs, root, pid)
     }
@@ -1512,7 +1571,7 @@ mod pilot_gap_tests {
             context_snapshot: HashMap::new(),
             owner_snapshot: HashMap::new(),
             emergency_stop_file: std::env::temp_dir().join("reaper-test-no-estop"),
-            recovery_faulted: false,
+            startup_fault: None,
         };
 
         observer.cycle().expect("observer cycle");

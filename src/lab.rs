@@ -169,6 +169,10 @@ pub fn receipt_path_current() -> PathBuf {
     registry_path().with_extension("receipts.jsonl")
 }
 
+pub fn close_audit_path_current() -> PathBuf {
+    registry_path().with_extension("close-audit.v1")
+}
+
 pub fn authorization_for(
     entry: &Entry,
     approval_ref: String,
@@ -180,6 +184,188 @@ pub fn authorization_for(
         "reaper-lab",
     );
     crate::terminate::ScopedAuthorization::new(scope, approval_ref)
+}
+
+const CLOSE_AUDIT_SCHEMA: &str = "REAPER_CLOSE_AUDIT_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseAuditRecord {
+    pub identity: String,
+    pub evidence_refs: Vec<String>,
+    pub policy_id: String,
+    pub policy_version: String,
+    pub authorization_scope: String,
+    pub approval_refs: Vec<String>,
+    pub grace_started_at: u64,
+    pub grace_ended_at: u64,
+    pub revalidation_results: String,
+    pub mechanism: String,
+    pub outcome: String,
+    pub errors: Vec<String>,
+    pub timestamp: u64,
+}
+
+impl CloseAuditRecord {
+    fn fields(&self) -> io::Result<Vec<String>> {
+        if [
+            self.identity.as_str(),
+            self.policy_id.as_str(),
+            self.policy_version.as_str(),
+            self.authorization_scope.as_str(),
+            self.revalidation_results.as_str(),
+            self.mechanism.as_str(),
+            self.outcome.as_str(),
+        ]
+        .iter()
+        .any(|value| value.is_empty())
+            || self.evidence_refs.is_empty()
+            || self.evidence_refs.iter().any(String::is_empty)
+            || self.approval_refs.is_empty()
+            || self.approval_refs.iter().any(String::is_empty)
+            || self.grace_ended_at < self.grace_started_at
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "close audit record is incomplete",
+            ));
+        }
+        Ok(vec![
+            self.identity.clone(),
+            self.evidence_refs.join("\n"),
+            self.policy_id.clone(),
+            self.policy_version.clone(),
+            self.authorization_scope.clone(),
+            self.approval_refs.join("\n"),
+            self.grace_started_at.to_string(),
+            self.grace_ended_at.to_string(),
+            self.revalidation_results.clone(),
+            self.mechanism.clone(),
+            self.outcome.clone(),
+            self.errors.join("\n"),
+            self.timestamp.to_string(),
+        ])
+    }
+}
+
+fn audit_hex(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn audit_unhex(value: &str) -> io::Result<String> {
+    if !value.len().is_multiple_of(2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "odd audit field",
+        ));
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid audit field"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 audit field"))
+}
+
+pub fn append_close_audit(path: &Path, record: &CloseAuditRecord) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = AUDIT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fields = record.fields()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if !existing.is_empty() && existing.lines().next() != Some(CLOSE_AUDIT_SCHEMA) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported close audit schema",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    if existing.is_empty() {
+        writeln!(file, "{CLOSE_AUDIT_SCHEMA}")?;
+    }
+    let encoded = fields
+        .iter()
+        .map(|value| audit_hex(value))
+        .collect::<Vec<_>>()
+        .join("\t");
+    writeln!(file, "{encoded}")?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    if reconstruct_close_audit(path)?.last() != Some(record) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted close audit did not reconstruct exactly",
+        ));
+    }
+    Ok(())
+}
+
+pub fn reconstruct_close_audit(path: &Path) -> io::Result<Vec<CloseAuditRecord>> {
+    let contents = fs::read_to_string(path)?;
+    let mut lines = contents.lines();
+    if lines.next() != Some(CLOSE_AUDIT_SCHEMA) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported close audit schema",
+        ));
+    }
+    lines
+        .map(|line| {
+            let fields = line
+                .split('\t')
+                .map(audit_unhex)
+                .collect::<io::Result<Vec<_>>>()?;
+            if fields.len() != 13 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete close audit record",
+                ));
+            }
+            let record = CloseAuditRecord {
+                identity: fields[0].clone(),
+                evidence_refs: fields[1].split('\n').map(str::to_owned).collect(),
+                policy_id: fields[2].clone(),
+                policy_version: fields[3].clone(),
+                authorization_scope: fields[4].clone(),
+                approval_refs: fields[5].split('\n').map(str::to_owned).collect(),
+                grace_started_at: fields[6].parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid grace start")
+                })?,
+                grace_ended_at: fields[7]
+                    .parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid grace end"))?,
+                revalidation_results: fields[8].clone(),
+                mechanism: fields[9].clone(),
+                outcome: fields[10].clone(),
+                errors: if fields[11].is_empty() {
+                    Vec::new()
+                } else {
+                    fields[11].split('\n').map(str::to_owned).collect()
+                },
+                timestamp: fields[12].parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid audit timestamp")
+                })?,
+            };
+            record.fields()?;
+            Ok(record)
+        })
+        .collect()
 }
 
 pub fn persist_close_receipt(entry: &Entry, stages: &[String], verdict: &str) -> io::Result<()> {
@@ -385,6 +571,39 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_audit_round_trip_reconstructs_all_required_fields_and_rejects_truncation() {
+        let root = std::env::temp_dir().join(format!(
+            "reaper-audit-schema-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("close.audit");
+        let expected = CloseAuditRecord {
+            identity: "pid:42:start:77:spawned:100".into(),
+            evidence_refs: vec!["scan:101".into(), "attestation:102".into()],
+            policy_id: "managed-close".into(),
+            policy_version: "1".into(),
+            authorization_scope: "service=42:77;registry=lab;project=demo".into(),
+            approval_refs: vec!["fresh-approval:42:77".into()],
+            grace_started_at: 101,
+            grace_ended_at: 105,
+            revalidation_results: "identity=true;coverage=true;idle=true;policy=true;proven=true"
+                .into(),
+            mechanism: "uds+pidfd-term".into(),
+            outcome: "closed".into(),
+            errors: Vec::new(),
+            timestamp: 105,
+        };
+        append_close_audit(&path, &expected).unwrap();
+        let records = reconstruct_close_audit(&path).unwrap();
+        assert_eq!(records, vec![expected]);
+        std::fs::write(&path, "REAPER_CLOSE_AUDIT_V1\nabc\n").unwrap();
+        assert!(reconstruct_close_audit(&path).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
     fn with_registry_path<T>(path: PathBuf, f: impl FnOnce() -> T) -> T {
         TEST_REGISTRY_PATH.with(|slot| *slot.borrow_mut() = Some(path));
         let result = f();

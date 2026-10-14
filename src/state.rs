@@ -86,6 +86,24 @@ pub fn grace_start_allowed(emergency_stop: bool, faulted: bool) -> bool {
     !emergency_stop && !faulted
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationalFault {
+    Connectivity,
+    Procfs,
+    StaleEvidence,
+    UnverifiableClients,
+    UnexpectedRestart,
+    CorruptState,
+}
+
+pub fn auto_action_initiation_allowed(fault: Option<OperationalFault>) -> bool {
+    fault.is_none()
+}
+
+pub fn inflight_grace_allowed(fault: Option<OperationalFault>) -> bool {
+    fault.is_none()
+}
+
 fn archive_invalid_state(path: &Path) -> String {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -305,6 +323,19 @@ impl Supervisor {
         }
     }
 
+    pub fn arm_grace_at(&mut self, pid: u32, started_unix: u64, deadline_unix: u64) {
+        self.arm_grace(pid, deadline_unix);
+        if let Some(entry) = self.entries.get_mut(&pid) {
+            entry.grace_start_wall = Some(started_unix);
+        }
+    }
+
+    pub fn grace_started_at(&self, pid: u32) -> Option<u64> {
+        self.entries
+            .get(&pid)
+            .and_then(|entry| entry.grace_start_wall)
+    }
+
     pub fn grace_expired(&self, pid: u32, now_unix: u64) -> bool {
         self.entries
             .get(&pid)
@@ -513,6 +544,23 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::identity::ProcessIdentity;
+
+    #[test]
+    fn each_operational_fault_blocks_initiation_and_inflight_grace_separately() {
+        for fault in [
+            OperationalFault::Connectivity,
+            OperationalFault::Procfs,
+            OperationalFault::StaleEvidence,
+            OperationalFault::UnverifiableClients,
+            OperationalFault::UnexpectedRestart,
+            OperationalFault::CorruptState,
+        ] {
+            assert!(!auto_action_initiation_allowed(Some(fault)));
+            assert!(!inflight_grace_allowed(Some(fault)));
+        }
+        assert!(auto_action_initiation_allowed(None));
+        assert!(inflight_grace_allowed(None));
+    }
 
     #[test]
     fn emergency_stop_persists_across_reload_and_blocks_grace() {
