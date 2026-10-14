@@ -32,6 +32,8 @@ enum View {
     Processes,
     Logs,
     Clients,
+    Evidence,
+    Help,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sort {
@@ -49,6 +51,9 @@ enum Key {
     Sort,
     Refresh,
     Logs,
+    Clients,
+    Evidence,
+    Help,
     Quit,
     Search,
     Char(char),
@@ -120,13 +125,10 @@ impl UiState {
                     Sort::Cpu => Sort::Rss,
                 }
             }
-            Key::Logs => {
-                self.view = match self.view {
-                    View::Processes => View::Logs,
-                    View::Logs => View::Clients,
-                    View::Clients => View::Processes,
-                }
-            }
+            Key::Logs => self.view = View::Logs,
+            Key::Clients => self.view = View::Clients,
+            Key::Evidence => self.view = View::Evidence,
+            Key::Help => self.view = View::Help,
             Key::Quit => self.quit = true,
             _ => {}
         }
@@ -150,6 +152,11 @@ struct Snapshot {
     rows: Vec<RowData>,
     clients: Vec<String>,
     events: Vec<String>,
+    ram: Option<(u64, u64)>,
+    swap: Option<(u64, u64)>,
+    refresh_skipped: usize,
+    supervisor: String,
+    self_cpu: Option<f64>,
 }
 
 fn snapshot_from(
@@ -241,7 +248,25 @@ fn snapshot_from(
         rows,
         clients,
         events,
+        ram: system_meminfo("MemTotal", "MemAvailable"),
+        swap: system_meminfo("SwapTotal", "SwapFree"),
+        refresh_skipped: 0,
+        supervisor: "observer (no separate supervisor)".into(),
+        self_cpu: None,
     }
+}
+
+fn system_meminfo(total_key: &str, free_key: &str) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let number = |key: &str| {
+        text.lines().find_map(|line| {
+            let (name, rest) = line.split_once(':')?;
+            (name == key)
+                .then(|| rest.split_whitespace().next()?.parse::<u64>().ok())
+                .flatten()
+        })
+    };
+    Some((number(total_key)?, number(free_key)?))
 }
 
 fn fast_snapshot() -> Snapshot {
@@ -299,6 +324,44 @@ fn cpu_percent(
     Some(delta as f64 * 100.0 / (hz.max(1) as f64 * now.duration_since(previous.at).as_secs_f64()))
 }
 
+fn clock_ticks_per_second() -> (u64, bool) {
+    match std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+    {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v > 0)
+            .map(|v| (v, false))
+            .unwrap_or((100, true)),
+        _ => (100, true),
+    }
+}
+
+fn self_cpu_percent(hz: u64) -> Option<f64> {
+    let sample = crate::stats::self_usage();
+    static PREVIOUS: std::sync::OnceLock<std::sync::Mutex<Option<(u64, Instant)>>> =
+        std::sync::OnceLock::new();
+    let mut previous = PREVIOUS
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()?;
+    let now = Instant::now();
+    let percent = previous.and_then(|(ticks, at)| {
+        (now > at)
+            .then(|| {
+                sample.cpu_ticks.checked_sub(ticks).map(|delta| {
+                    delta as f64 * 100.0 / (hz.max(1) as f64 * now.duration_since(at).as_secs_f64())
+                })
+            })
+            .flatten()
+    });
+    *previous = Some((sample.cpu_ticks, now));
+    percent
+}
+
 fn decorate_cpu(
     snap: &mut Snapshot,
     history: &mut HashMap<(u32, u64), CpuSample>,
@@ -326,6 +389,51 @@ fn decorate_cpu(
                 cpu_percent(old, start, ticks, now, hz)
             });
     }
+}
+
+fn process_tree(rows: &[RowData]) -> Vec<(&RowData, usize)> {
+    let by_pid: HashMap<u32, &RowData> = rows.iter().map(|r| (r.process.pid, r)).collect();
+    fn visit<'a>(
+        pid: u32,
+        depth: usize,
+        by_pid: &HashMap<u32, &'a RowData>,
+        out: &mut Vec<(&'a RowData, usize)>,
+        seen: &mut std::collections::HashSet<u32>,
+    ) {
+        if !seen.insert(pid) {
+            return;
+        }
+        let Some(row) = by_pid.get(&pid) else {
+            return;
+        };
+        out.push((*row, depth));
+        let mut children: Vec<_> = by_pid
+            .values()
+            .filter(|c| c.process.ppid == pid)
+            .map(|c| c.process.pid)
+            .collect();
+        children.sort_unstable();
+        for child in children {
+            visit(child, depth + 1, by_pid, out, seen);
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut roots: Vec<_> = rows
+        .iter()
+        .filter(|r| !by_pid.contains_key(&r.process.ppid))
+        .map(|r| r.process.pid)
+        .collect();
+    roots.sort_unstable();
+    for pid in roots {
+        visit(pid, 0, &by_pid, &mut out, &mut seen);
+    }
+    let mut rest: Vec<_> = rows.iter().map(|r| r.process.pid).collect();
+    rest.sort_unstable();
+    for pid in rest {
+        visit(pid, 0, &by_pid, &mut out, &mut seen);
+    }
+    out
 }
 
 // Full client/work assessment may launch external probes and take many seconds.
@@ -369,6 +477,24 @@ fn show_swap_cpu(width: u16) -> bool {
     width >= 60
 }
 
+fn uptime_seconds(start_ticks: u64) -> u64 {
+    let hz = 100u64;
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
+    uptime
+        .map(|s| (s.max(0.0) as u64).saturating_sub(start_ticks / hz))
+        .unwrap_or(0)
+}
+
+fn client_label(state: &str) -> String {
+    if state.starts_with("ConnectedVerified") {
+        "connected".into()
+    } else {
+        "unknown".into()
+    }
+}
+
 fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
@@ -396,35 +522,85 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                 .map(|s| Line::from(s.as_str())),
         ),
         View::Clients => lines.extend(snap.clients.iter().map(|s| Line::from(s.as_str()))),
+        View::Evidence => {
+            for row in &snap.rows {
+                lines.push(Line::from(format!(
+                    "pid={} protected={:?}: {}",
+                    row.process.pid, row.tier, row.reason
+                )));
+                lines.extend(
+                    row.evidence
+                        .iter()
+                        .map(|s| Line::from(format!("  evidence: {s}"))),
+                );
+                lines.extend(
+                    row.blocks
+                        .iter()
+                        .map(|s| Line::from(format!("  block: {s}"))),
+                );
+            }
+        }
+        View::Help => lines.extend(
+            [
+                "↑/↓ select  / search  Enter detail",
+                "t tree/list  s sort CPU/RSS/swap/name",
+                "l events  c clients  e evidence  ? help",
+                "r refresh  q quit (read-only; no destructive keys)",
+            ]
+            .into_iter()
+            .map(Line::from),
+        ),
         View::Processes => {
-            let rows = filtered_sorted(&snap.rows, &state.query, state.sort);
+            let rows = if state.tree {
+                process_tree(&snap.rows)
+                    .into_iter()
+                    .map(|(r, _)| r)
+                    .filter(|r| {
+                        state.query.is_empty()
+                            || r.process
+                                .name
+                                .to_lowercase()
+                                .contains(&state.query.to_lowercase())
+                    })
+                    .collect()
+            } else {
+                filtered_sorted(&snap.rows, &state.query, state.sort)
+            };
             let wide = show_swap_cpu(area.width);
             let mut headers = vec![
                 Cell::from("PID"),
                 Cell::from("NAME"),
                 Cell::from("CPU%"),
                 Cell::from("RSS KiB"),
+                Cell::from("SWAP"),
+                Cell::from("STATE"),
+                Cell::from("UPTIME"),
+                Cell::from("CLIENT"),
             ];
-            if wide {
-                headers.push(Cell::from("SWAP KiB"));
-            }
             headers.push(Cell::from("TIER"));
             let widths = if wide {
                 vec![
                     Constraint::Length(7),
                     Constraint::Min(8),
+                    Constraint::Length(7),
                     Constraint::Length(9),
-                    Constraint::Length(8),
+                    Constraint::Length(7),
                     Constraint::Length(5),
+                    Constraint::Length(8),
+                    Constraint::Length(8),
                     Constraint::Length(12),
                 ]
             } else {
                 vec![
                     Constraint::Length(7),
-                    Constraint::Min(8),
-                    Constraint::Length(8),
-                    Constraint::Length(9),
-                    Constraint::Length(12),
+                    Constraint::Min(3),
+                    Constraint::Length(5),
+                    Constraint::Length(7),
+                    Constraint::Length(5),
+                    Constraint::Length(3),
+                    Constraint::Length(6),
+                    Constraint::Length(6),
+                    Constraint::Length(6),
                 ]
             };
             let table_rows = rows.iter().enumerate().map(|(i, r)| {
@@ -432,7 +608,12 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                 let mut cells = vec![
                     Cell::from(p.pid.to_string()),
                     Cell::from(if state.tree {
-                        format!("{}{}", if p.ppid == 0 { "" } else { "└ " }, p.name)
+                        let depth = process_tree(&snap.rows)
+                            .iter()
+                            .find(|(row, _)| row.process.pid == p.pid)
+                            .map(|(_, d)| *d)
+                            .unwrap_or(0);
+                        format!("{}{}", "  ".repeat(depth), p.name)
                     } else {
                         p.name.clone()
                     }),
@@ -442,10 +623,11 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                             .unwrap_or_else(|| "—".into()),
                     ),
                     Cell::from(p.rss_kib.to_string()),
+                    Cell::from(p.swap_kib.to_string()),
+                    Cell::from(p.state.to_string()),
+                    Cell::from(format!("{}s", uptime_seconds(p.start_ticks))),
+                    Cell::from(client_label(&r.client_state)),
                 ];
-                if wide {
-                    cells.push(Cell::from(p.swap_kib.to_string()));
-                }
                 cells.push(Cell::from(format!("{:?}", r.tier)));
                 Row::new(cells).style(if i == state.selected {
                     Style::default()
@@ -515,20 +697,15 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                     .title(match state.view {
                         View::Logs => "Recent events",
                         View::Clients => "Managed clients",
+                        View::Evidence => "Evidence and block reasons",
+                        View::Help => "Key help",
                         _ => "Processes",
                     }),
             ),
             chunks[0],
         );
     }
-    let status = format!(
-        "↑↓ navigate  / search  Enter inspect  t tree/list  s sort(CPU/RSS/swap/name)  r refresh  l logs/clients  q quit{}",
-        if state.searching {
-            "  Esc exit search"
-        } else {
-            ""
-        }
-    );
+    let status = format!("↑↓ navigate / search Enter detail t tree s sort l events c clients e evidence ? help r refresh q quit | visible={} protected={} observed={} candidate={} ownCPU={} supervisor={} RAM={} swap={} skippedRefreshes={}", snap.rows.len(), snap.rows.iter().filter(|r| r.tier != Tier::Unknown).count(), snap.rows.len(), snap.rows.iter().filter(|r| r.blocks.is_empty() && r.tier == Tier::Known).count(), snap.self_cpu.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "—".into()), snap.supervisor, snap.ram.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()), snap.swap.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()), snap.refresh_skipped);
     frame.render_widget(Paragraph::new(status), chunks[chunks.len() - 1]);
 }
 
@@ -557,6 +734,9 @@ fn key_event(key: crossterm::event::KeyEvent) -> Key {
         KeyCode::Char('s') => Key::Sort,
         KeyCode::Char('r') => Key::Refresh,
         KeyCode::Char('l') => Key::Logs,
+        KeyCode::Char('c') => Key::Clients,
+        KeyCode::Char('e') => Key::Evidence,
+        KeyCode::Char('?') => Key::Help,
         KeyCode::Char('q') => Key::Quit,
         KeyCode::Char('/') => Key::Search,
         KeyCode::Char(c) => Key::Char(c),
@@ -579,14 +759,23 @@ pub fn run() -> io::Result<()> {
     let mut state = UiState::default();
     let (tx, rx) = mpsc::sync_channel(1);
     let mut snap = Snapshot::default();
-    let mut history = HashMap::new();
+    let mut in_flight = true;
+    let mut skipped_refreshes = 0usize;
+    let (clock_hz, assumed_hz) = clock_ticks_per_second();
     let spawn_refresh = |tx: mpsc::SyncSender<(Snapshot, Instant)>| {
+        let mut history = HashMap::new();
         if thread::Builder::new()
             .name("reaper-tui-snapshot".into())
             .spawn(move || {
                 let mut snapshot = fast_snapshot();
                 let sampled_at = Instant::now();
-                decorate_cpu(&mut snapshot, &mut HashMap::new(), sampled_at, 100);
+                decorate_cpu(&mut snapshot, &mut history, sampled_at, clock_hz);
+                snapshot.self_cpu = self_cpu_percent(clock_hz);
+                if assumed_hz {
+                    snapshot
+                        .supervisor
+                        .push_str("; CLK_TCK=100 fallback assumption");
+                }
                 let _ = tx.try_send((snapshot, sampled_at));
             })
             .is_err()
@@ -598,29 +787,10 @@ pub fn run() -> io::Result<()> {
         let count = filtered_sorted(&snap.rows, &state.query, state.sort).len();
         state.selected = state.selected.min(count.saturating_sub(1));
         terminal.draw(|f| render(f, &state, &snap))?;
-        if let Ok((mut completed, at)) = rx.try_recv() {
+        if let Ok((mut completed, _at)) = rx.try_recv() {
+            in_flight = false;
             // Worker-published counters preserve the snapshot's acquisition boundary.
-            for row in &mut completed.rows {
-                let key = (row.process.pid, row.process.start_ticks);
-                let sample = std::fs::read_to_string(format!("/proc/{}/stat", key.0))
-                    .ok()
-                    .and_then(|value| procfs::parse_cpu_stat(&value));
-                row.cpu_percent = sample.and_then(|(pid, ticks, start)| {
-                    if pid != key.0 || start != key.1 {
-                        return None;
-                    }
-                    let previous = history.get(&key).copied();
-                    history.insert(
-                        key,
-                        CpuSample {
-                            ticks,
-                            at,
-                            start_ticks: start,
-                        },
-                    );
-                    cpu_percent(previous, start, ticks, at, 100)
-                });
-            }
+            completed.refresh_skipped = skipped_refreshes;
             snap = completed;
         }
         if crossterm::event::poll(Duration::from_millis(200))? {
@@ -637,7 +807,12 @@ pub fn run() -> io::Result<()> {
                     state.handle(k, count);
                 }
                 if k == Key::Refresh {
-                    spawn_refresh(tx.clone());
+                    if in_flight {
+                        skipped_refreshes += 1;
+                    } else {
+                        in_flight = true;
+                        spawn_refresh(tx.clone());
+                    }
                 }
                 if state.quit {
                     break;
@@ -645,7 +820,12 @@ pub fn run() -> io::Result<()> {
             }
         }
         if last_tick.elapsed() >= Duration::from_secs(1) {
-            spawn_refresh(tx.clone());
+            if in_flight {
+                skipped_refreshes += 1;
+            } else {
+                in_flight = true;
+                spawn_refresh(tx.clone());
+            }
             last_tick = Instant::now();
         }
     }
@@ -714,7 +894,7 @@ mod tests {
         assert_eq!(s.sort, Sort::Swap);
         s.handle(Key::Logs, 2);
         assert_eq!(s.view, View::Logs);
-        s.handle(Key::Logs, 2);
+        s.handle(Key::Clients, 2);
         assert_eq!(s.view, View::Clients);
         s.handle(Key::Quit, 2);
         assert!(s.quit);
@@ -723,6 +903,20 @@ mod tests {
     fn narrow_width_hides_swap_and_cpu_columns() {
         assert!(!show_swap_cpu(59));
         assert!(show_swap_cpu(60));
+    }
+
+    #[test]
+    fn small_and_resize_frames_render_without_panicking() {
+        let backend = ratatui::backend::TestBackend::new(10, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = UiState::default();
+        let snap = fixture();
+        terminal.draw(|f| render(f, &state, &snap)).unwrap();
+        state.tree = true;
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 40, 10))
+            .unwrap();
+        terminal.draw(|f| render(f, &state, &snap)).unwrap();
     }
 
     #[test]
@@ -745,6 +939,63 @@ mod tests {
             cpu_percent(Some(old), 9, 490, at + Duration::from_secs(2), 100),
             None
         );
+    }
+
+    #[test]
+    fn cpu_uses_actual_non_100_clock_rate() {
+        let at = Instant::now();
+        let previous = CpuSample {
+            ticks: 100,
+            at,
+            start_ticks: 1,
+        };
+        assert_eq!(
+            cpu_percent(Some(previous), 1, 125, at + Duration::from_secs(1), 250),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn busy_refresh_is_skipped_not_queued() {
+        let mut in_flight = true;
+        let mut skipped = 0;
+        if in_flight {
+            skipped += 1;
+        } else {
+            in_flight = true;
+        }
+        assert!(in_flight);
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn tree_orders_parent_before_child() {
+        let mut a = proc(1, "parent", 1);
+        a.ppid = 0;
+        let mut b = proc(2, "child", 1);
+        b.ppid = 1;
+        let mut snap = fixture();
+        snap.rows.clear();
+        for p in [b, a] {
+            let rel = relations::build(std::slice::from_ref(&p));
+            snap.rows.extend(
+                snapshot_from(
+                    &[p],
+                    &rel,
+                    Some(1000),
+                    &Registry::default(),
+                    vec![],
+                    &std::collections::HashMap::new(),
+                )
+                .rows,
+            );
+        }
+        let tree = process_tree(&snap.rows);
+        assert_eq!(
+            tree.iter().map(|(r, _)| r.process.pid).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(tree[1].1, 1);
     }
 
     #[test]
