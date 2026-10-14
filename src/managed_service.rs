@@ -2089,3 +2089,22 @@ pub fn serve() -> io::Result<()> {
     crate::lab::unregister_managed_service(&entry)?;
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod fresh_close_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn missing_fresh_scan_target_is_explicitly_refused() {
+        let entry = crate::lab::Entry {
+            pid: u32::MAX,
+            start_ticks: 1,
+            spawned_at: 0,
+        };
+
+        let error = fresh_lab_approval(&entry, std::path::Path::new("unused.sock"), true)
+            .expect_err("an absent fresh-scan target must not be approved");
+
+        assert!(error.to_string().contains("missing from fresh procfs scan"));
+    }
+}
