@@ -43,6 +43,18 @@ pub fn parse_stat(input: &str) -> Option<(u32, String, char, u32, u32, u32, u64)
     ))
 }
 
+/// Parse cumulative CPU ticks and start time from a proc stat record.
+pub fn parse_cpu_stat(input: &str) -> Option<(u32, u64, u64)> {
+    let l = input.find('(')?;
+    let r = input.rfind(')')?;
+    let pid = input[..l].trim().parse().ok()?;
+    let fields: Vec<&str> = input[r + 1..].split_whitespace().collect();
+    let user: u64 = fields.get(11)?.parse().ok()?;
+    let system: u64 = fields.get(12)?.parse().ok()?;
+    let start: u64 = fields.get(19)?.parse().ok()?;
+    Some((pid, user.checked_add(system)?, start))
+}
+
 fn status_numbers(path: &std::path::Path) -> (Option<u32>, u64, u64) {
     let Ok(content) = fs::read_to_string(path) else {
         return (None, 0, 0);
@@ -108,12 +120,16 @@ pub fn scan_root(root: &std::path::Path) -> ScanOutcome {
             skipped_stat += 1;
             continue;
         };
-        let Some((real_pid, name, state, ppid, pgrp, session, start_ticks)) = parse_stat(&stat)
+        let Some((real_pid, _, cpu_start)) = parse_cpu_stat(&stat) else {
+            skipped_stat += 1;
+            continue;
+        };
+        let Some((parsed_pid, name, state, ppid, pgrp, session, start_ticks)) = parse_stat(&stat)
         else {
             skipped_stat += 1;
             continue;
         };
-        if real_pid != pid {
+        if real_pid != pid || parsed_pid != pid || cpu_start != start_ticks {
             skipped_mismatch += 1;
             continue;
         }

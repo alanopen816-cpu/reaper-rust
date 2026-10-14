@@ -20,7 +20,10 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::{
+    collections::HashMap,
     io,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -32,8 +35,9 @@ enum View {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sort {
+    Cpu,
     Rss,
-    Pid,
+    Swap,
     Name,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +47,7 @@ enum Key {
     Enter,
     Tree,
     Sort,
+    Refresh,
     Logs,
     Quit,
     Search,
@@ -109,9 +114,10 @@ impl UiState {
             Key::Tree => self.tree = !self.tree,
             Key::Sort => {
                 self.sort = match self.sort {
-                    Sort::Rss => Sort::Pid,
-                    Sort::Pid => Sort::Name,
-                    Sort::Name => Sort::Rss,
+                    Sort::Rss => Sort::Swap,
+                    Sort::Swap => Sort::Name,
+                    Sort::Name => Sort::Cpu,
+                    Sort::Cpu => Sort::Rss,
                 }
             }
             Key::Logs => {
@@ -137,6 +143,7 @@ struct RowData {
     blocks: Vec<String>,
     owner: OwnerVerdict,
     client_state: String,
+    cpu_percent: Option<f64>,
 }
 #[derive(Clone, Debug, Default)]
 struct Snapshot {
@@ -200,6 +207,7 @@ fn snapshot_from(
                 blocks,
                 owner,
                 client_state,
+                cpu_percent: None,
             }
         })
         .collect();
@@ -271,6 +279,55 @@ fn fast_snapshot() -> Snapshot {
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CpuSample {
+    ticks: u64,
+    at: Instant,
+    start_ticks: u64,
+}
+
+fn cpu_percent(
+    previous: Option<CpuSample>,
+    start_ticks: u64,
+    ticks: u64,
+    now: Instant,
+    hz: u64,
+) -> Option<f64> {
+    let previous =
+        previous.filter(|sample| sample.start_ticks == start_ticks && now > sample.at)?;
+    let delta = ticks.checked_sub(previous.ticks)?;
+    Some(delta as f64 * 100.0 / (hz.max(1) as f64 * now.duration_since(previous.at).as_secs_f64()))
+}
+
+fn decorate_cpu(
+    snap: &mut Snapshot,
+    history: &mut HashMap<(u32, u64), CpuSample>,
+    now: Instant,
+    hz: u64,
+) {
+    for row in &mut snap.rows {
+        row.cpu_percent = std::fs::read_to_string(format!("/proc/{}/stat", row.process.pid))
+            .ok()
+            .and_then(|stat| procfs::parse_cpu_stat(&stat))
+            .and_then(|(pid, ticks, start)| {
+                if pid != row.process.pid || start != row.process.start_ticks {
+                    return None;
+                }
+                let key = (pid, start);
+                let old = history.get(&key).copied();
+                history.insert(
+                    key,
+                    CpuSample {
+                        ticks,
+                        at: now,
+                        start_ticks: start,
+                    },
+                );
+                cpu_percent(old, start, ticks, now, hz)
+            });
+    }
+}
+
 // Full client/work assessment may launch external probes and take many seconds.
 // Keep this observer responsive and direct users to `reaper pilot report` instead.
 
@@ -291,8 +348,14 @@ fn filtered_sorted<'a>(rows: &'a [RowData], query: &str, sort: Sort) -> Vec<&'a 
         })
         .collect();
     match sort {
+        Sort::Cpu => rows.sort_by(|a, b| {
+            b.cpu_percent
+                .unwrap_or(-1.0)
+                .partial_cmp(&a.cpu_percent.unwrap_or(-1.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
         Sort::Rss => rows.sort_by_key(|r| std::cmp::Reverse(r.process.rss_kib)),
-        Sort::Pid => rows.sort_by_key(|r| r.process.pid),
+        Sort::Swap => rows.sort_by_key(|r| std::cmp::Reverse(r.process.swap_kib)),
         Sort::Name => rows.sort_by(|a, b| {
             a.process
                 .name
@@ -308,6 +371,9 @@ fn show_swap_cpu(width: u16) -> bool {
 
 fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
     let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let narrow = area.width < 40;
     let chunks = if narrow || !state.inspecting {
         Layout::default()
@@ -333,9 +399,14 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
         View::Processes => {
             let rows = filtered_sorted(&snap.rows, &state.query, state.sort);
             let wide = show_swap_cpu(area.width);
-            let mut headers = vec![Cell::from("PID"), Cell::from("NAME"), Cell::from("RSS KiB")];
+            let mut headers = vec![
+                Cell::from("PID"),
+                Cell::from("NAME"),
+                Cell::from("CPU%"),
+                Cell::from("RSS KiB"),
+            ];
             if wide {
-                headers.extend([Cell::from("SWAP"), Cell::from("CPU")]);
+                headers.push(Cell::from("SWAP KiB"));
             }
             headers.push(Cell::from("TIER"));
             let widths = if wide {
@@ -351,6 +422,7 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                 vec![
                     Constraint::Length(7),
                     Constraint::Min(8),
+                    Constraint::Length(8),
                     Constraint::Length(9),
                     Constraint::Length(12),
                 ]
@@ -364,10 +436,15 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                     } else {
                         p.name.clone()
                     }),
+                    Cell::from(
+                        r.cpu_percent
+                            .map(|v| format!("{v:.1}"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
                     Cell::from(p.rss_kib.to_string()),
                 ];
                 if wide {
-                    cells.extend([Cell::from(p.swap_kib.to_string()), Cell::from("—")]);
+                    cells.push(Cell::from(p.swap_kib.to_string()));
                 }
                 cells.push(Cell::from(format!("{:?}", r.tier)));
                 Row::new(cells).style(if i == state.selected {
@@ -406,11 +483,13 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                             row.process.uid
                         )),
                         Line::from(format!("{} — {}", row.process.name, row.process.command)),
-                        Line::from(format!("protection={:?}: {}", row.tier, row.reason)),
+                    Line::from(format!("protection={:?}: {}", row.tier, row.reason)),
+                    Line::from(format!("protected because: {}", row.reason)),
                         Line::from(format!("decision={}", row.decision)),
                         Line::from(format!("owner verdict={:?}", row.owner)),
                         Line::from(format!("client registry={}", row.client_state)),
-                        Line::from("full client/work evidence: `reaper pilot report`"),
+                    Line::from("full client/work evidence: `reaper pilot report`"),
+                    Line::from("missing evidence: full client/work adapters are deferred to pilot report"),
                         Line::from("Evidence:"),
                     ];
                     detail.extend(row.evidence.iter().map(|s| Line::from(s.as_str())));
@@ -443,7 +522,7 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
         );
     }
     let status = format!(
-        "↑↓ navigate  / search  Enter inspect  t tree/list  s sort  l logs/clients  q quit{}",
+        "↑↓ navigate  / search  Enter inspect  t tree/list  s sort(CPU/RSS/swap/name)  r refresh  l logs/clients  q quit{}",
         if state.searching {
             "  Esc exit search"
         } else {
@@ -457,7 +536,11 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen
+        );
     }
 }
 
@@ -472,6 +555,7 @@ fn key_event(key: crossterm::event::KeyEvent) -> Key {
         KeyCode::Enter => Key::Enter,
         KeyCode::Char('t') => Key::Tree,
         KeyCode::Char('s') => Key::Sort,
+        KeyCode::Char('r') => Key::Refresh,
         KeyCode::Char('l') => Key::Logs,
         KeyCode::Char('q') => Key::Quit,
         KeyCode::Char('/') => Key::Search,
@@ -485,29 +569,75 @@ fn key_event(key: crossterm::event::KeyEvent) -> Key {
 pub fn run() -> io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
-    crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut state = UiState::default();
-    // Fast snapshotting is deliberately in-process/read-only so the first frame is immediate.
-    let mut snap = fast_snapshot();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let mut snap = Snapshot::default();
+    let mut history = HashMap::new();
+    let spawn_refresh = |tx: mpsc::SyncSender<(Snapshot, Instant)>| {
+        if thread::Builder::new()
+            .name("reaper-tui-snapshot".into())
+            .spawn(move || {
+                let mut snapshot = fast_snapshot();
+                let sampled_at = Instant::now();
+                decorate_cpu(&mut snapshot, &mut HashMap::new(), sampled_at, 100);
+                let _ = tx.try_send((snapshot, sampled_at));
+            })
+            .is_err()
+        { /* A failed refresh leaves the last known snapshot visible. */ }
+    };
+    spawn_refresh(tx.clone());
     let mut last_tick = Instant::now();
     loop {
-        let filtered = filtered_sorted(&snap.rows, &state.query, state.sort);
-        state.selected = state.selected.min(filtered.len().saturating_sub(1));
+        let count = filtered_sorted(&snap.rows, &state.query, state.sort).len();
+        state.selected = state.selected.min(count.saturating_sub(1));
         terminal.draw(|f| render(f, &state, &snap))?;
+        if let Ok((mut completed, at)) = rx.try_recv() {
+            // Worker-published counters preserve the snapshot's acquisition boundary.
+            for row in &mut completed.rows {
+                let key = (row.process.pid, row.process.start_ticks);
+                let sample = std::fs::read_to_string(format!("/proc/{}/stat", key.0))
+                    .ok()
+                    .and_then(|value| procfs::parse_cpu_stat(&value));
+                row.cpu_percent = sample.and_then(|(pid, ticks, start)| {
+                    if pid != key.0 || start != key.1 {
+                        return None;
+                    }
+                    let previous = history.get(&key).copied();
+                    history.insert(
+                        key,
+                        CpuSample {
+                            ticks,
+                            at,
+                            start_ticks: start,
+                        },
+                    );
+                    cpu_percent(previous, start, ticks, at, 100)
+                });
+            }
+            snap = completed;
+        }
         if crossterm::event::poll(Duration::from_millis(200))? {
             if let crossterm::event::Event::Key(k) = crossterm::event::read()? {
                 let k = key_event(k);
                 if state.searching && k == Key::Esc {
-                    state.handle(k, filtered.len());
+                    state.handle(k, count);
                 } else if state.searching {
                     match k {
-                        Key::Char(_) | Key::Backspace => state.handle(k, filtered.len()),
+                        Key::Char(_) | Key::Backspace => state.handle(k, count),
                         _ => {}
                     }
                 } else {
-                    state.handle(k, filtered.len());
+                    state.handle(k, count);
+                }
+                if k == Key::Refresh {
+                    spawn_refresh(tx.clone());
                 }
                 if state.quit {
                     break;
@@ -515,7 +645,7 @@ pub fn run() -> io::Result<()> {
             }
         }
         if last_tick.elapsed() >= Duration::from_secs(1) {
-            snap = fast_snapshot();
+            spawn_refresh(tx.clone());
             last_tick = Instant::now();
         }
     }
@@ -555,9 +685,9 @@ mod tests {
     #[test]
     fn filter_matching_and_sort_orders() {
         let s = fixture();
-        assert_eq!(filtered_sorted(&s.rows, "alp", Sort::Pid).len(), 1);
+        assert_eq!(filtered_sorted(&s.rows, "alp", Sort::Name).len(), 1);
         assert_eq!(filtered_sorted(&s.rows, "", Sort::Rss)[0].process.pid, 2);
-        assert_eq!(filtered_sorted(&s.rows, "", Sort::Pid)[0].process.pid, 1);
+        assert_eq!(filtered_sorted(&s.rows, "", Sort::Name)[0].process.pid, 1);
         assert_eq!(
             filtered_sorted(&s.rows, "", Sort::Name)[0].process.name,
             "alpha"
@@ -581,7 +711,7 @@ mod tests {
         s.handle(Key::Tree, 2);
         assert!(s.tree);
         s.handle(Key::Sort, 2);
-        assert_eq!(s.sort, Sort::Pid);
+        assert_eq!(s.sort, Sort::Swap);
         s.handle(Key::Logs, 2);
         assert_eq!(s.view, View::Logs);
         s.handle(Key::Logs, 2);
@@ -593,6 +723,62 @@ mod tests {
     fn narrow_width_hides_swap_and_cpu_columns() {
         assert!(!show_swap_cpu(59));
         assert!(show_swap_cpu(60));
+    }
+
+    #[test]
+    fn cumulative_cpu_delta_is_time_normalized_and_identity_safe() {
+        let at = Instant::now();
+        let old = CpuSample {
+            ticks: 500,
+            at,
+            start_ticks: 9,
+        };
+        assert_eq!(
+            cpu_percent(Some(old), 9, 510, at + Duration::from_secs(2), 100),
+            Some(5.0)
+        );
+        assert_eq!(
+            cpu_percent(Some(old), 10, 510, at + Duration::from_secs(2), 100),
+            None
+        );
+        assert_eq!(
+            cpu_percent(Some(old), 9, 490, at + Duration::from_secs(2), 100),
+            None
+        );
+    }
+
+    #[test]
+    fn cpu_history_accumulates_across_snapshots() {
+        let at = Instant::now();
+        let mut history = HashMap::new();
+        history.insert(
+            (42, 3),
+            CpuSample {
+                ticks: 100,
+                at,
+                start_ticks: 3,
+            },
+        );
+        assert_eq!(
+            cpu_percent(
+                history.get(&(42, 3)).copied(),
+                3,
+                110,
+                at + Duration::from_secs(1),
+                100
+            ),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn zero_sized_frame_is_ignored() {
+        let backend = ratatui::backend::TestBackend::new(0, 0);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = UiState::default();
+        terminal
+            .draw(|frame| render(frame, &state, &Snapshot::default()))
+            .unwrap();
     }
     #[test]
     fn snapshots_are_pure_and_detail_keeps_evidence_and_blocks() {
