@@ -1,6 +1,7 @@
 //! Lab-only child registry. No arbitrary PID input is accepted for cleanup.
 #[path = "lab_autonomy.rs"]
 mod autonomy;
+pub use autonomy::close_ready_entry;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -177,9 +178,29 @@ pub fn persist_close_receipt(entry: &Entry, stages: &[String], verdict: &str) ->
         .collect::<Vec<_>>()
         .join(",");
     let timestamp = now();
+    let authorization_refs = if verdict == "closed" {
+        "[\"proven\",\"policy_recomputed\",\"lab_registry\"]"
+    } else {
+        "[]"
+    };
     let line = format!(
-        "{{\"scope\":\"reaper-lab\",\"pid\":{},\"start_ticks\":{},\"spawned_at\":{},\"stages\":[{}],\"authorization_refs\":[\"proven\",\"policy_recomputed\",\"lab_registry\"],\"timestamp\":{},\"verdict\":{}}}\n",
-        entry.pid, entry.start_ticks, entry.spawned_at, stages, timestamp, quote(verdict)
+        "{{\"scope\":\"reaper-lab\",\"pid\":{},\"start_ticks\":{},\"spawned_at\":{},\"stages\":[{}],\"authorization_refs\":{},\"timestamp\":{},\"verdict\":{},\"reason\":{}}}\n",
+        entry.pid,
+        entry.start_ticks,
+        entry.spawned_at,
+        stages,
+        authorization_refs,
+        timestamp,
+        quote(match verdict {
+            "closed" => "closed",
+            "in_progress" => "in_progress",
+            _ => "refused",
+        }),
+        quote(match verdict {
+            "closed" => "close confirmed",
+            "in_progress" => "close initiated; restart requires full revalidation",
+            _ => verdict,
+        })
     );
     let mut file = OpenOptions::new()
         .create(true)

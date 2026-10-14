@@ -697,6 +697,32 @@ impl Observer {
                             .into(),
                     }
                 };
+                if let Some(entry) = lab::current_registry()?
+                    .into_iter()
+                    .find(|entry| entry.pid == p.pid && entry.start_ticks == p.start_ticks)
+                {
+                    match lab::close_ready_entry(&entry) {
+                        Ok(receipts) => {
+                            for receipt in receipts {
+                                st.log_bytes += logx::log(
+                                    &self.log_cfg,
+                                    logx::Level::Info,
+                                    "lab.close.stage",
+                                    &format!("pid={} {receipt}", entry.pid),
+                                )?;
+                            }
+                        }
+                        Err(error) => {
+                            st.errors += 1;
+                            st.log_bytes += logx::log(
+                                &self.log_cfg,
+                                logx::Level::Warn,
+                                "lab.close.refused",
+                                &format!("pid={} reason={error}", entry.pid),
+                            )?;
+                        }
+                    }
+                }
             }
             // Rescue during grace: owner evidence flipped back while we hold a
             // deadline — cancel explicitly and say so.
@@ -1218,6 +1244,54 @@ mod pilot_gap_tests {
             .map(|entry| fs::read_to_string(entry.path()).expect("read cycle log"))
             .collect::<String>();
         assert!(log.contains("fresh post-grace evidence or complete client coverage missing"));
+    }
+
+    #[test]
+    fn ready_lab_entry_runs_final_gate_and_persists_refusal_without_signalling_unknown_target() {
+        let _guard = lab::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = std::process::id();
+        let registry = std::env::temp_dir().join(format!("reaper-ready-lab-{pid}.json"));
+        std::env::set_var("REAPER_LAB_REGISTRY", &registry);
+        let child = lab::spawn(false).expect("spawn registered lab child");
+        lab::persist_close_receipt(&child.entry, &["term_sent".into()], "in_progress")
+            .expect("persist fabricated mid-close state");
+        let process = procfs::scan()
+            .processes
+            .into_iter()
+            .find(|process| process.pid == child.id())
+            .expect("lab child visible");
+        let boot_id = identity::read_boot_id();
+        let id = identity::identify(&process, boot_id.clone());
+        let root = std::env::temp_dir().join(format!("reaper-ready-lab-cycle-{pid}"));
+        let mut supervisor = Supervisor::new(root.join("supervisor.state"));
+        supervisor.transition(
+            &id,
+            State::ReadyForRevalidation,
+            1,
+            "test:ready-lab",
+            "test-policy",
+            "readiness feeds final close gate",
+        );
+        let mut observer = Observer {
+            tracker: Tracker::new(boot_id.clone()),
+            supervisor,
+            policy: Policy::default(),
+            log_cfg: logx::LogConfig::new(root.join("logs")),
+            boot_id,
+            usage_start: stats::self_usage(),
+            deep_scheduler: pilot::DeepScheduler::default(),
+            context_snapshot: HashMap::new(),
+            owner_snapshot: HashMap::new(),
+        };
+
+        observer.cycle().expect("observer cycle");
+        let receipt = fs::read_to_string(lab::receipt_path_current()).expect("refusal receipt");
+        assert!(receipt.contains("\"verdict\":\"refused\""), "{receipt}");
+        assert!(
+            lab::identity_ticks(child.id()).is_ok(),
+            "refusal signalled child"
+        );
+        drop(child);
     }
 
     #[test]
