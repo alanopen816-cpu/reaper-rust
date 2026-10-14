@@ -162,6 +162,9 @@ struct Snapshot {
     self_cpu: Option<f64>,
     clock_rate_estimated: bool,
     clock_hz: Option<u64>,
+    motor_summary: String,
+    grace: String,
+    pilot: String,
 }
 
 fn snapshot_from(
@@ -173,7 +176,7 @@ fn snapshot_from(
     owners: &std::collections::HashMap<u32, (String, bool, u64)>,
 ) -> Snapshot {
     let self_pid = std::process::id();
-    let rows = processes
+    let rows: Vec<RowData> = processes
         .iter()
         .map(|p| {
             let protection = protect(p, self_pid, rel, uid);
@@ -249,6 +252,24 @@ fn snapshot_from(
             )
         })
         .collect();
+    let motor_summary = [
+        "KeepProtected",
+        "Observe",
+        "GraceCandidate",
+        "ReadyForRevalidation",
+        "Blocked",
+    ]
+    .iter()
+    .map(|variant| {
+        format!(
+            "{variant}={}",
+            rows.iter()
+                .filter(|r| r.decision.starts_with(variant))
+                .count()
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
     Snapshot {
         rows,
         clients,
@@ -260,7 +281,85 @@ fn snapshot_from(
         self_cpu: None,
         clock_rate_estimated: false,
         clock_hz: None,
+        motor_summary,
+        grace: "unavailable(state directory unavailable)".into(),
+        pilot: "unavailable(state directory unavailable)".into(),
     }
+}
+
+fn operation_state(state_dir: &std::path::Path, rows: &[RowData]) -> (String, String) {
+    use std::collections::BTreeMap;
+    let state = match std::fs::read_to_string(state_dir.join("supervisor.json")) {
+        Ok(state) => state,
+        Err(e) => return (format!("unavailable({e})"), pilot_summary(state_dir)),
+    };
+    let mut deadlines = BTreeMap::new();
+    let mut lines = state.lines();
+    if lines.next() != Some("REAPER_STATE_V1") {
+        return (
+            "unavailable(invalid state format)".into(),
+            pilot_summary(state_dir),
+        );
+    }
+    for line in lines {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() < 5 || fields[3] != "GRACE_PERIOD" {
+            continue;
+        }
+        if let (Ok(pid), Ok(start), Ok(deadline)) = (
+            fields[0].parse::<u32>(),
+            fields[1].parse::<u64>(),
+            fields[4].parse::<u64>(),
+        ) {
+            if rows
+                .iter()
+                .any(|r| r.process.pid == pid && r.process.start_ticks == start)
+            {
+                deadlines.insert(pid, deadline);
+            }
+        }
+    }
+    let grace = if deadlines.is_empty() {
+        "none armed".into()
+    } else {
+        deadlines
+            .iter()
+            .map(|(pid, deadline)| format!("pid={pid} deadline_unix={deadline}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    (grace, pilot_summary(state_dir))
+}
+
+fn pilot_summary(state_dir: &std::path::Path) -> String {
+    let pidfile = match std::fs::read_to_string(state_dir.join("pilot.pid")) {
+        Ok(s) => s,
+        Err(e) => return format!("unavailable({e})"),
+    };
+    let pid = pidfile
+        .split("\"pid\":")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .filter(|s| !s.is_empty());
+    let heartbeat = match std::fs::read_to_string(state_dir.join("pilot.heartbeat")) {
+        Ok(s) => s,
+        Err(e) => return format!("unavailable({e})"),
+    };
+    let fields: Vec<_> = heartbeat.trim().split('\t').collect();
+    if fields.len() < 6 || pid != Some(fields[0]) {
+        return "unavailable(invalid or mismatched pilot heartbeat)".into();
+    }
+    format!(
+        "pid={} since={} entries={} last_gap={}",
+        fields[0],
+        fields[5],
+        fields[3],
+        if fields[4].is_empty() {
+            "none"
+        } else {
+            fields[4]
+        }
+    )
 }
 
 fn system_meminfo(total_key: &str, free_key: &str) -> Option<(u64, u64)> {
@@ -301,14 +400,18 @@ fn fast_snapshot() -> Snapshot {
         })
         .unwrap_or_default();
     let owners = crate::owner::claims_map(&crate::owner::default_svdir());
-    snapshot_from(
+    let mut snapshot = snapshot_from(
         &scan.processes,
         &rel,
         crate::own_uid(),
         &registry,
         events,
         &owners,
-    )
+    );
+    let (grace, pilot) = operation_state(&logx::default_state_dir(), &snapshot.rows);
+    snapshot.grace = grace;
+    snapshot.pilot = pilot;
+    snapshot
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -561,12 +664,13 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
         View::Operations => lines.extend(
             [
                 format!("supervisor: {}", snap.supervisor),
-                "pilot unavailable (pid/heartbeat absent); observed time unavailable".into(),
+                format!("pilot: {}; observed time unavailable", snap.pilot),
                 format!(
-                    "active processes={} (procfs); candidates unavailable (motor decisions absent)",
-                    snap.rows.len()
+                    "active processes={} (procfs); motor decisions: {}",
+                    snap.rows.len(),
+                    snap.motor_summary
                 ),
-                "grace unavailable (timer absent); protected list in process view".into(),
+                format!("grace: {}; protected list in process view", snap.grace),
                 "block reasons in inspector; client coverage unavailable (registry only)".into(),
                 format!(
                     "decision history unavailable; interruption evidence={} log entries",
@@ -707,7 +811,7 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                     Line::from(format!("protection={:?}: {}", row.tier, row.reason)),
                     Line::from(format!("protected because: {}", row.reason)),
                         Line::from(format!("decision={}", row.decision)),
-                        Line::from("motor candidacy unavailable: snapshot has no motor decision"),
+                        Line::from(format!("motor decision={}", row.decision)),
                         Line::from("identity/clients/work/coverage/grace/policy candidacy blocks are not available"),
                         Line::from(format!("owner verdict={:?}", row.owner)),
                         Line::from(format!("client registry={}", row.client_state)),
@@ -747,13 +851,13 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
             chunks[0],
         );
     }
-    // The observer snapshot has no motor decision, grace timer, or supervisor
-    // decision stream. Never infer candidate counts from protection/block heuristics.
-    let status = format!("CPU%*=/proc ticks RSS/SWAP*=/proc/status KiB (unreadable=0) RAM/SWAP=/proc/meminfo; visible={} protected={} observed={} candidate=unavailable(no motor decisions) RAM={} swap={} ownCPU={} supervisor={} skippedRefreshes={} grace=unavailable decision=unavailable",
+    // Never infer candidacy from protection/block heuristics.
+    let status = format!("CPU%*=/proc ticks RSS/SWAP*=/proc/status KiB (unreadable=0) RAM/SWAP=/proc/meminfo; visible={} protected={} observed={} motor=[{}] RAM={} swap={} ownCPU={} supervisor={} skippedRefreshes={} grace={} pilot={}",
         snap.rows.len(), snap.rows.iter().filter(|r| r.tier != Tier::Unknown).count(), snap.rows.len(),
+        snap.motor_summary,
         snap.ram.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()),
         snap.swap.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()),
-        cpu_metric(snap.self_cpu, snap.clock_rate_estimated), snap.supervisor, snap.refresh_skipped);
+        cpu_metric(snap.self_cpu, snap.clock_rate_estimated), snap.supervisor, snap.refresh_skipped, snap.grace, snap.pilot);
     frame.render_widget(Paragraph::new(status), chunks[chunks.len() - 1]);
 }
 
@@ -914,6 +1018,36 @@ mod tests {
         )
     }
     #[test]
+    fn operations_snapshot_includes_motor_grace_and_pilot_fixtures() {
+        let mut snap = fixture();
+        let dir = std::env::temp_dir().join(format!(
+            "reaper-ops-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let process = &snap.rows[0].process;
+        std::fs::write(
+            dir.join("supervisor.json"),
+            format!(
+                "REAPER_STATE_V1\n{}\t{}\t-\tGRACE_PERIOD\t12345\t-\t\t\t\t\t\n",
+                process.pid, process.start_ticks
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("pilot.pid"), "{\"pid\":77,\"start_ticks\":1}\n").unwrap();
+        std::fs::write(dir.join("pilot.heartbeat"), "77\t1000\t900\t4\tgap\t800\n").unwrap();
+        let (grace, pilot) = operation_state(&dir, &snap.rows);
+        snap.grace = grace;
+        snap.pilot = pilot;
+        assert!(snap.motor_summary.contains("KeepProtected="));
+        assert!(snap.grace.contains("deadline_unix=12345"));
+        assert!(snap
+            .pilot
+            .contains("pid=77 since=800 entries=4 last_gap=gap"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
     fn filter_matching_and_sort_orders() {
         let s = fixture();
         assert_eq!(filtered_sorted(&s.rows, "alp", Sort::Name).len(), 1);
@@ -1029,7 +1163,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("candidate=unavailable"));
+        assert!(text.contains("motor=[KeepProtected="));
         assert!(text.contains("grace=unavailable"));
     }
 
@@ -1038,7 +1172,7 @@ mod tests {
         let mut state = UiState::default();
         state.handle(Key::Operations, 0);
         assert_eq!(state.view, View::Operations);
-        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let backend = ratatui::backend::TestBackend::new(200, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &state, &fixture())).unwrap();
         let text = terminal
@@ -1048,8 +1182,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("candidates unavailable"));
-        assert!(text.contains("pilot unavailable"));
+        assert!(text.contains("motor decisions:"));
+        assert!(text.contains("pilot: unavailable"));
         let before = state.clone();
         for key in [
             Key::Operations,
