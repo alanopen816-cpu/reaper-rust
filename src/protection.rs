@@ -35,7 +35,9 @@ pub fn apply_classification(
     positively_verified_inactive: bool,
 ) -> Protection {
     if class == crate::identity::ProcessClass::Unknown {
-        protection.tier = Tier::Unknown;
+        if protection.tier != Tier::Absolute {
+            protection.tier = Tier::Unknown;
+        }
         protection.reason = "classification unknown; protected by default".into();
     } else if !(class == crate::identity::ProcessClass::Independent && positively_verified_inactive)
     {

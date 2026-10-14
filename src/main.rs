@@ -32,7 +32,7 @@ mod tui;
 use adapters::{Codex, GenericLinux, Liveness, McpBroker, OpenCode, OwnerAdapter, RunitService};
 use events::{Event, Tracker};
 use policy::{Decision, Policy, Signals};
-use protection::{protect, Tier};
+use protection::{apply_classification, protect, Protection, Tier};
 use relations::Relations;
 use state::{State, Supervisor};
 use std::collections::HashMap;
@@ -126,6 +126,36 @@ fn decide_state(decision: &Decision, current: Option<State>) -> State {
             }
         }
     }
+}
+
+/// The production classification-to-policy boundary, kept pure so cycle
+/// decisions can be exercised with deterministic process evidence.
+#[allow(clippy::too_many_arguments)]
+fn classified_decision(
+    p: &procfs::Process,
+    id: &identity::ProcessIdentity,
+    rel: &Relations,
+    owner: &owner::OwnerVerdict,
+    client_or_work_active: Option<bool>,
+    positively_verified_inactive: bool,
+    base: Protection,
+    policy: &Policy,
+    signals: &Signals,
+    extensions: &[&dyn identity::Classifier],
+) -> (identity::ProcessClass, Protection, Decision) {
+    let class = identity::classify(
+        &identity::ClassificationEvidence {
+            process: p,
+            identity: id,
+            relations: rel,
+            owner,
+            client_or_work_active,
+        },
+        extensions,
+    );
+    let protection = apply_classification(base, class, positively_verified_inactive);
+    let decision = policy::decide(policy, &protection, p, signals);
+    (class, protection, decision)
 }
 
 fn render_scan(processes: &[procfs::Process], rel: &Relations, uid: Option<u32>) {
@@ -390,7 +420,7 @@ impl Observer {
             {
                 continue;
             }
-            let prot = protect(p, self_pid, &rel, uid);
+            let base_prot = protect(p, self_pid, &rel, uid);
             let adapter = adapter_for(&p.name, &p.command);
             // Owner verdict refines the adapter's Unknown: a live supervise
             // claim means the owner considers it up; a down-claim means the
@@ -457,7 +487,7 @@ impl Observer {
             let (last_client_gone, no_pending_work) = evidence::client_work_to_fields(&client_work);
             let ev = evidence::AbandonEvidence {
                 lab_member,
-                owner: owner_evidence,
+                owner: owner_evidence.clone(),
                 grace_expired: false,
                 revalidated_now: false,
                 owner_dead: match owner_active {
@@ -476,7 +506,31 @@ impl Observer {
                 memory_pressure: false,
                 client_coverage: coverage,
             };
-            let decision = policy::decide(&self.policy, &prot, p, &signals);
+            let positively_verified_inactive =
+                matches!(client_work, evidence::ClientWorkState::IdleVerified { .. })
+                    && coverage == client_tracker::Coverage::CompleteVerified
+                    && owner_active == Some(false);
+            let work_activity = match client_work {
+                evidence::ClientWorkState::Active { .. } => Some(true),
+                evidence::ClientWorkState::IdleVerified { .. } => Some(false),
+                evidence::ClientWorkState::Unknown { .. }
+                | evidence::ClientWorkState::Error { .. }
+                | evidence::ClientWorkState::WorkAbsent { .. } => None,
+            };
+            let classification_activity =
+                client_tracker::combine_signals(owner_active, work_activity);
+            let (_class, _prot, decision) = classified_decision(
+                p,
+                &id,
+                &rel,
+                &owner_evidence,
+                classification_activity,
+                positively_verified_inactive,
+                base_prot,
+                &self.policy,
+                &signals,
+                &[],
+            );
             let current = self.supervisor.state_of(p.pid);
             // Rescue during grace: owner evidence flipped back while we hold a
             // deadline — cancel explicitly and say so.
@@ -816,6 +870,200 @@ fn main() {
 #[cfg(test)]
 mod pilot_gap_tests {
     use super::*;
+
+    fn fixture(name: &str, ppid: u32) -> (procfs::Process, Relations) {
+        let p = procfs::Process {
+            pid: 50,
+            ppid,
+            pgrp: 50,
+            session: 60,
+            start_ticks: 10,
+            state: 'S',
+            name: name.into(),
+            command: name.into(),
+            rss_kib: 0,
+            swap_kib: 0,
+            uid: Some(10373),
+        };
+        let parent = procfs::Process {
+            pid: ppid,
+            ppid,
+            pgrp: ppid,
+            session: ppid,
+            start_ticks: 1,
+            state: 'S',
+            name: "parent".into(),
+            command: "parent".into(),
+            rss_kib: 0,
+            swap_kib: 0,
+            uid: Some(10373),
+        };
+        let rel = relations::build(&[parent, p.clone()]);
+        (p, rel)
+    }
+
+    fn signals(active: Option<bool>) -> Signals {
+        Signals {
+            owner_reports_active: active,
+            proven_abandoned: false,
+            needs_tolerance: false,
+            memory_pressure: false,
+            client_coverage: client_tracker::Coverage::Unknown,
+        }
+    }
+
+    #[test]
+    fn production_decision_keeps_unknown_protected_and_orphan_unabandoned() {
+        let (p, rel) = fixture("worker", 1);
+        let id = identity::identify(&p, None);
+        let owner = owner::OwnerVerdict::Unclaimed;
+        let (class, protection, decision) = classified_decision(
+            &p,
+            &id,
+            &rel,
+            &owner,
+            None,
+            false,
+            Protection {
+                tier: Tier::Known,
+                reason: "base".into(),
+            },
+            &Policy::default(),
+            &signals(None),
+            &[],
+        );
+        assert_eq!(class, identity::ProcessClass::Unknown);
+        assert_eq!(protection.tier, Tier::Unknown);
+        assert!(matches!(decision, Decision::KeepProtected { .. }));
+        assert!(!evidence::proven(&evidence::AbandonEvidence {
+            lab_member: false,
+            owner,
+            grace_expired: true,
+            revalidated_now: true,
+            owner_dead: Some(true),
+            last_client_gone: Some(true),
+            no_pending_work: Some(true),
+        }));
+    }
+
+    #[test]
+    fn production_decision_never_lowers_absolute_protection_on_misclassification() {
+        struct Wrong;
+        impl identity::Classifier for Wrong {
+            fn classify(
+                &self,
+                _: &identity::ClassificationEvidence<'_>,
+            ) -> Option<identity::ProcessClass> {
+                Some(identity::ProcessClass::Independent)
+            }
+        }
+        let (p, rel) = fixture("worker", 8);
+        let id = identity::identify(&p, None);
+        let owner = owner::OwnerVerdict::Unclaimed;
+        let wrong = Wrong;
+        let (_, protection, decision) = classified_decision(
+            &p,
+            &id,
+            &rel,
+            &owner,
+            Some(false),
+            true,
+            Protection {
+                tier: Tier::Absolute,
+                reason: "absolute".into(),
+            },
+            &Policy::default(),
+            &signals(Some(false)),
+            &[&wrong],
+        );
+        assert_eq!(protection.tier, Tier::Absolute);
+        assert!(matches!(
+            decision,
+            Decision::KeepProtected {
+                tier: Tier::Absolute,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn production_decision_protects_extension_class_and_evaluates_verified_inactive() {
+        struct Critical;
+        impl identity::Classifier for Critical {
+            fn classify(
+                &self,
+                _: &identity::ClassificationEvidence<'_>,
+            ) -> Option<identity::ProcessClass> {
+                Some(identity::ProcessClass::Critical)
+            }
+        }
+        let (p, rel) = fixture("ordinary", 8);
+        let id = identity::identify(&p, None);
+        let owner = owner::OwnerVerdict::Unclaimed;
+        let critical = Critical;
+        let (_, protection, decision) = classified_decision(
+            &p,
+            &id,
+            &rel,
+            &owner,
+            Some(true),
+            false,
+            Protection {
+                tier: Tier::Known,
+                reason: "base".into(),
+            },
+            &Policy::default(),
+            &signals(Some(true)),
+            &[&critical],
+        );
+        assert_eq!(protection.tier, Tier::Contextual);
+        assert!(matches!(decision, Decision::KeepProtected { .. }));
+
+        let (_, protection, decision) = classified_decision(
+            &p,
+            &id,
+            &rel,
+            &owner,
+            Some(false),
+            true,
+            Protection {
+                tier: Tier::Known,
+                reason: "base".into(),
+            },
+            &Policy::default(),
+            &signals(Some(false)),
+            &[],
+        );
+        assert_eq!(protection.tier, Tier::Known);
+        assert!(matches!(decision, Decision::Blocked { .. }));
+    }
+
+    #[test]
+    fn spoofed_name_and_old_sleeper_do_not_classify_as_candidate() {
+        for name in ["runsv", "ancient-sleeper"] {
+            let (p, rel) = fixture(name, 1);
+            let id = identity::identify(&p, None);
+            let owner = owner::OwnerVerdict::Unclaimed;
+            let (class, protection, decision) = classified_decision(
+                &p,
+                &id,
+                &rel,
+                &owner,
+                None,
+                false,
+                Protection {
+                    tier: Tier::Known,
+                    reason: "base".into(),
+                },
+                &Policy::default(),
+                &signals(None),
+                &[],
+            );
+            assert_ne!(class, identity::ProcessClass::Independent);
+            assert_ne!(protection.tier, Tier::Known);
+            assert!(!matches!(decision, Decision::GraceCandidate { .. }));
+        }
+    }
 
     #[test]
     fn runit_process_name_without_identity_claim_is_not_a_service() {
