@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 const SCHEMA_VERSION: &str = "REAPER_STATE_V1";
+const MAX_STATE_FILE_BYTES: usize = 1024 * 1024;
 static STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn hex(s: &str) -> String {
@@ -252,6 +253,16 @@ impl Supervisor {
                 hex(&e.policy)
             ));
         }
+        if out.len() > MAX_STATE_FILE_BYTES {
+            // The caller logs state.persist_failed; preserve the old atomic state file.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "state size cap exceeded ({} > {MAX_STATE_FILE_BYTES} bytes)",
+                    out.len()
+                ),
+            ));
+        }
         use std::io::Write;
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -407,6 +418,45 @@ mod tests {
         assert_eq!((t.from, t.to), (State::Discovered, State::Observing));
         assert_eq!(t.evidence, "scan");
         assert_eq!(s.state_of(5), Some(State::Observing));
+    }
+
+    #[test]
+    fn oversized_state_refuses_without_replacing_existing_state() {
+        let dir = std::env::temp_dir().join(format!("reaper-state-cap-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("state");
+        fs::write(&file, "previous valid state").unwrap();
+        let mut supervisor = Supervisor::new(file.clone());
+        supervisor.transition(
+            &id(55, 66),
+            State::Observing,
+            1,
+            &"x".repeat(600_000),
+            "p",
+            "r",
+        );
+        let error = supervisor
+            .persist()
+            .expect_err("oversized state must refuse");
+        assert!(error.to_string().contains("state size cap"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "previous valid state");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_state_remains_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("reaper-state-mode-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("state");
+        let mut supervisor = Supervisor::new(file.clone());
+        supervisor.transition(&id(56, 67), State::Observing, 1, "e", "p", "r");
+        supervisor.persist().unwrap();
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

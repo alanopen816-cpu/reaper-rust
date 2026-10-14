@@ -10,6 +10,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
+const MAX_LOG_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_LOG_FILES_PER_DAY: usize = 16;
+const MAX_RETAIN_DAYS: usize = 14;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Error,
@@ -39,7 +43,7 @@ pub struct LogConfig {
     pub min_level: Level,
     /// Rotate when the active file exceeds this size (default 1 MiB).
     pub rotate_bytes: u64,
-    /// Keep this many daily files (default 14). 0 keeps everything.
+    /// Requested retention; the hard upper bound remains MAX_RETAIN_DAYS.
     pub retain_days: usize,
 }
 
@@ -158,11 +162,17 @@ fn day_name(time: u64) -> String {
 }
 
 /// Resolve the active log file, rotating by size (`<day>-N.jsonl`).
-fn active_file(cfg: &LogConfig, time: u64) -> std::io::Result<PathBuf> {
+fn active_file(cfg: &LogConfig, time: u64, line_bytes: u64) -> std::io::Result<PathBuf> {
     fs::create_dir_all(&cfg.dir)?;
+    let file_cap = cfg.rotate_bytes.min(MAX_LOG_FILE_BYTES);
+    if line_bytes > file_cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "log record exceeds configured or hard size cap",
+        ));
+    }
     let base = day_name(time);
-    let mut n = 0;
-    loop {
+    for n in 0..MAX_LOG_FILES_PER_DAY {
         let name = if n == 0 {
             format!("{base}.jsonl")
         } else {
@@ -170,11 +180,14 @@ fn active_file(cfg: &LogConfig, time: u64) -> std::io::Result<PathBuf> {
         };
         let path = cfg.dir.join(name);
         let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if size < cfg.rotate_bytes || n > 999 {
+        if size.saturating_add(line_bytes) <= file_cap {
             return Ok(path);
         }
-        n += 1;
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "daily log rotation count cap reached; event was not written",
+    ))
 }
 
 /// Append one event. Returns bytes written (0 when below min_level).
@@ -183,8 +196,6 @@ pub fn log(cfg: &LogConfig, level: Level, event: &str, detail: &str) -> std::io:
         return Ok(0);
     }
     let time = now_secs();
-    let path = active_file(cfg, time)?;
-    let mut f = OpenOptions::new().append(true).create(true).open(path)?;
     let line = format!(
         "{{\"time_unix\":{},\"level\":\"{}\",\"event\":\"{}\",\"detail\":\"{}\"}}\n",
         time,
@@ -192,15 +203,33 @@ pub fn log(cfg: &LogConfig, level: Level, event: &str, detail: &str) -> std::io:
         esc(event),
         esc(&redact(detail))
     );
+    let path = active_file(cfg, time, line.len() as u64)?;
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     f.write_all(line.as_bytes())?;
+    // Bound accumulation even when callers request retain_days=0 or >14.
+    enforce_retention(cfg, &day_name(time));
     Ok(line.len())
 }
 
 /// Delete daily files older than `retain_days` (by filename date). Returns removed count.
 pub fn enforce_retention(cfg: &LogConfig, today: &str) -> usize {
-    if cfg.retain_days == 0 {
-        return 0;
-    }
+    let retain_days = if cfg.retain_days == 0 {
+        MAX_RETAIN_DAYS
+    } else {
+        cfg.retain_days.min(MAX_RETAIN_DAYS)
+    };
     let Ok(entries) = fs::read_dir(&cfg.dir) else {
         return 0;
     };
@@ -214,7 +243,7 @@ pub fn enforce_retention(cfg: &LogConfig, today: &str) -> usize {
         // Lexicographic compare is valid for zero-padded YYYY-MM-DD.
         if day < today
             && is_dated(name.len(), &name)
-            && day_old_enough(day, today, cfg.retain_days)
+            && day_old_enough(day, today, retain_days)
             && fs::remove_file(entry.path()).is_ok()
         {
             removed += 1;
@@ -295,6 +324,50 @@ mod tests {
         }
         let files: Vec<_> = fs::read_dir(&dir).unwrap().collect();
         assert!(files.len() >= 2, "expected rotated files");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_count_is_hard_bounded_and_oversized_records_refuse() {
+        let (dir, mut c) = cfg("bounded-growth");
+        c.rotate_bytes = 180;
+        for _ in 0..17 {
+            let _ = log(&c, Level::Info, "e", &"d".repeat(100));
+        }
+        assert!(
+            log(&c, Level::Info, "e", &"d".repeat(100)).is_err(),
+            "rotation limit must refuse rather than append to an unbounded file"
+        );
+        assert!(fs::read_dir(&dir).unwrap().count() <= 16);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, c) = cfg("private");
+        log(&c, Level::Info, "e", "d").unwrap();
+        let path = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hard_record_size_cap_rejects_without_creating_a_file() {
+        let (dir, mut c) = cfg("record-cap");
+        c.rotate_bytes = u64::MAX;
+        let error = log(
+            &c,
+            Level::Info,
+            "e",
+            &"x".repeat(MAX_LOG_FILE_BYTES as usize),
+        )
+        .expect_err("record larger than the hard file cap must be refused");
+        assert!(error.to_string().contains("size cap"));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

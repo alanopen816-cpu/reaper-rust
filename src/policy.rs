@@ -307,4 +307,28 @@ mod tests {
             Decision::KeepProtected { .. }
         ));
     }
+
+    #[test]
+    fn source_has_no_hard_system_dependency_invocations() {
+        // This source guard covers direct Command::new literals; a production
+        // hard-coded invocation of adb, su, systemctl, proot, or proot-distro trips it.
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let forbidden = ["adb", "su", "systemctl", "proot", "proot-distro"];
+        for entry in std::fs::read_dir(source_dir).unwrap().flatten() {
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(entry.path()).unwrap();
+            let normalized = source.split_whitespace().collect::<String>();
+            for binary in forbidden {
+                let direct = format!("Command::new(\"{binary}\"");
+                let qualified = format!("std::process::Command::new(\"{binary}\"");
+                assert!(
+                    !normalized.contains(&direct) && !normalized.contains(&qualified),
+                    "mandatory system dependency invocation found in {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
 }

@@ -549,21 +549,34 @@ pub fn sv_status(service: &str) -> SvState {
 }
 
 pub fn meminfo_swap() -> (u64, u64) {
-    let Ok(contents) = fs::read_to_string("/proc/meminfo") else {
-        return (0, 0);
-    };
+    meminfo_swap_verified().unwrap_or((0, 0))
+}
+
+/// Exact SwapTotal/SwapFree KiB values, or unavailable when either procfs key is missing.
+pub fn meminfo_swap_verified() -> Option<(u64, u64)> {
+    let contents = fs::read_to_string("/proc/meminfo").ok()?;
     let mut total = 0;
     let mut free = 0;
+    let mut saw_total = false;
+    let mut saw_free = false;
     for line in contents.lines() {
         let mut parts = line.split_whitespace();
-        let value = parts.nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let Some(value) = parts.nth(1).and_then(|s| s.parse().ok()) else {
+            continue;
+        };
         match line.split(':').next().unwrap_or("") {
-            "SwapTotal" => total = value,
-            "SwapFree" => free = value,
+            "SwapTotal" => {
+                total = value;
+                saw_total = true;
+            }
+            "SwapFree" => {
+                free = value;
+                saw_free = true;
+            }
             _ => {}
         }
     }
-    (total, free)
+    (saw_total && saw_free).then_some((total, free))
 }
 
 pub fn dir_size_bytes(path: &std::path::Path) -> u64 {
@@ -595,6 +608,54 @@ pub fn dir_size_bytes(path: &std::path::Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn own_children_with_env(key: &str, value: &str) -> Vec<u32> {
+        fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+                let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let fields = stat
+                    .rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                if fields.get(1)?.parse::<u32>().ok()? != std::process::id() {
+                    return None;
+                }
+                let env = fs::read(format!("/proc/{pid}/environ")).ok()?;
+                env.split(|byte| *byte == 0)
+                    .any(|field| field == format!("{key}={value}").as_bytes())
+                    .then_some(pid)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn over_budget_opencode_query_reaps_its_child() {
+        let token = format!("{}-{}", std::process::id(), now_test_nonce());
+        let before = own_children_with_env("REAPER_QUERY_CHILD_TEST", &token);
+        assert!(
+            before.is_empty(),
+            "unexpected matching child before test: {before:?}"
+        );
+        let mut command = Command::new("sleep");
+        command.arg("30").env("REAPER_QUERY_CHILD_TEST", &token);
+        assert!(run_opencode_command(&mut command, Duration::from_millis(30)).is_err());
+        assert!(
+            own_children_with_env("REAPER_QUERY_CHILD_TEST", &token).is_empty(),
+            "over-budget OpenCode query left a matching child"
+        );
+    }
+
+    fn now_test_nonce() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    }
 
     #[test]
     fn broker_health_parser_requires_explicit_boolean() {

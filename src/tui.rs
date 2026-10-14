@@ -157,6 +157,8 @@ struct Snapshot {
     refresh_skipped: usize,
     supervisor: String,
     self_cpu: Option<f64>,
+    clock_rate_estimated: bool,
+    clock_hz: Option<u64>,
 }
 
 fn snapshot_from(
@@ -253,6 +255,8 @@ fn snapshot_from(
         refresh_skipped: 0,
         supervisor: "observer (no separate supervisor)".into(),
         self_cpu: None,
+        clock_rate_estimated: false,
+        clock_hz: None,
     }
 }
 
@@ -340,13 +344,11 @@ fn clock_ticks_per_second() -> (u64, bool) {
     }
 }
 
-fn discovered_clock_ticks() -> Option<u64> {
-    let (hz, estimated) = clock_ticks_per_second();
-    (!estimated).then_some(hz)
-}
-
 fn self_cpu_percent(hz: u64) -> Option<f64> {
     let sample = crate::stats::self_usage();
+    if !sample.cpu_available {
+        return None;
+    }
     static PREVIOUS: std::sync::OnceLock<std::sync::Mutex<Option<(u64, Instant)>>> =
         std::sync::OnceLock::new();
     let mut previous = PREVIOUS
@@ -365,6 +367,15 @@ fn self_cpu_percent(hz: u64) -> Option<f64> {
     });
     *previous = Some((sample.cpu_ticks, now));
     percent
+}
+
+/// CPU percentages are rounded to 0.1%; fallback CLK_TCK is explicitly estimated.
+fn cpu_metric(value: Option<f64>, estimated: bool) -> String {
+    match value {
+        Some(value) if estimated => format!("~{value:.1}% estimated"),
+        Some(value) => format!("{value:.1}%"),
+        None => "unavailable".into(),
+    }
 }
 
 fn decorate_cpu(
@@ -574,14 +585,16 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
             let mut headers = vec![
                 Cell::from("PID"),
                 Cell::from("NAME"),
-                Cell::from("CPU%"),
-                Cell::from("RSS KiB"),
-                Cell::from("SWAP"),
+                Cell::from("CPU%*"),
+                Cell::from("RSS KiB*"),
+                Cell::from("SWAP KiB*"),
                 Cell::from("STATE"),
                 Cell::from("UPTIME"),
                 Cell::from("CLIENT"),
             ];
             headers.push(Cell::from("TIER"));
+            // RSS/Swap are procfs status values in KiB; inaccessible status
+            // currently parses as zero, so the asterisk is part of their availability contract.
             let widths = if wide {
                 vec![
                     Constraint::Length(7),
@@ -621,18 +634,14 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                     } else {
                         p.name.clone()
                     }),
-                    Cell::from(
-                        r.cpu_percent
-                            .map(|v| format!("{v:.1}"))
-                            .unwrap_or_else(|| "—".into()),
-                    ),
+                    Cell::from(cpu_metric(r.cpu_percent, snap.clock_rate_estimated)),
                     Cell::from(p.rss_kib.to_string()),
                     Cell::from(p.swap_kib.to_string()),
                     Cell::from(p.state.to_string()),
                     Cell::from(
-                        uptime_seconds(p.start_ticks, discovered_clock_ticks())
-                            .map(|seconds| format!("{seconds}s"))
-                            .unwrap_or_else(|| "— est.".into()),
+                        uptime_seconds(p.start_ticks, snap.clock_hz)
+                            .map(|seconds| format!("{seconds}s /proc"))
+                            .unwrap_or_else(|| "unavailable".into()),
                     ),
                     Cell::from(client_label(&r.client_state)),
                 ];
@@ -715,7 +724,11 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
     }
     // The observer snapshot has no motor decision, grace timer, or supervisor
     // decision stream. Never infer candidate counts from protection/block heuristics.
-    let status = format!("↑↓ navigate / search Enter detail t tree s sort l events c clients e evidence ? help r refresh q quit | visible={} protected={} observed={} candidate=unavailable(snapshot has no motor decisions) ownCPU={} supervisor={} RAM={} swap={} skippedRefreshes={} grace=unavailable decision=unavailable", snap.rows.len(), snap.rows.iter().filter(|r| r.tier != Tier::Unknown).count(), snap.rows.len(), snap.self_cpu.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "—".into()), snap.supervisor, snap.ram.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()), snap.swap.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()), snap.refresh_skipped);
+    let status = format!("CPU%*=/proc ticks RSS/SWAP*=/proc/status KiB (unreadable=0) RAM/SWAP=/proc/meminfo; visible={} protected={} observed={} candidate=unavailable(no motor decisions) RAM={} swap={} ownCPU={} supervisor={} skippedRefreshes={} grace=unavailable decision=unavailable",
+        snap.rows.len(), snap.rows.iter().filter(|r| r.tier != Tier::Unknown).count(), snap.rows.len(),
+        snap.ram.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()),
+        snap.swap.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()),
+        cpu_metric(snap.self_cpu, snap.clock_rate_estimated), snap.supervisor, snap.refresh_skipped);
     frame.render_widget(Paragraph::new(status), chunks[chunks.len() - 1]);
 }
 
@@ -781,6 +794,8 @@ pub fn run() -> io::Result<()> {
                 let sampled_at = Instant::now();
                 decorate_cpu(&mut snapshot, &mut history, sampled_at, clock_hz);
                 snapshot.self_cpu = self_cpu_percent(clock_hz);
+                snapshot.clock_rate_estimated = assumed_hz;
+                snapshot.clock_hz = (!assumed_hz).then_some(clock_hz);
                 if assumed_hz {
                     snapshot
                         .supervisor
@@ -990,6 +1005,34 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("candidate=unavailable"));
         assert!(text.contains("grace=unavailable"));
+    }
+
+    #[test]
+    fn estimated_cpu_metric_cannot_render_as_exact() {
+        let rendered = cpu_metric(Some(12.345), true);
+        assert!(rendered.starts_with('~'));
+        assert!(rendered.contains("estimated"));
+        assert_eq!(cpu_metric(Some(12.345), false), "12.3%");
+        assert_eq!(cpu_metric(None, false), "unavailable");
+    }
+
+    #[test]
+    fn rendered_measurement_headers_name_their_sources() {
+        let backend = ratatui::backend::TestBackend::new(400, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, &UiState::default(), &fixture()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("CPU%*=/proc ticks"));
+        assert!(text.contains("RSS/SWAP*=/proc/status KiB"));
+        assert!(text.contains("/proc/meminfo"));
     }
 
     #[test]
