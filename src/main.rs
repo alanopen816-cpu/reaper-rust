@@ -1131,7 +1131,7 @@ fn main() {
                     .and_then(|index| args.get(index + 1))
                     .and_then(|value| value.parse::<u64>().ok())
                     .unwrap_or(2)
-                    .clamp(1, 10);
+                    .clamp(1, 300);
                 managed_service::run_demo(grace)
             }
             #[cfg(not(unix))]

@@ -943,6 +943,11 @@ fn emit_step(number: usize, evidence: &str) {
 }
 
 #[cfg(unix)]
+fn emit_monotonic(event: &str, origin: std::time::Instant) {
+    println!("TIME {event}={:.3}s", origin.elapsed().as_secs_f64());
+}
+
+#[cfg(unix)]
 fn wait_for_job(agent: &mut DemoAgent, job: &str) -> io::Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -967,6 +972,7 @@ pub fn run_demo(grace_secs: u64) -> io::Result<()> {
     use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    let monotonic_origin = std::time::Instant::now();
     let processes = crate::procfs::scan().processes;
     let sentinel = processes
         .iter()
@@ -1164,10 +1170,13 @@ pub fn run_demo(grace_secs: u64) -> io::Result<()> {
     {
         return Err(io::Error::other("first short grace expired immediately"));
     }
+    let first_grace_started = std::time::Instant::now();
+    emit_monotonic("grace1_start", monotonic_origin);
     emit_step(
         11,
         &format!("observer armed first full {grace_secs}s grace"),
     );
+    thread::sleep(Duration::from_secs(grace_secs));
 
     if client.request("CONNECT client-a")?.trim() != "CONNECTED client-a" {
         return Err(io::Error::other("live reconnect failed"));
@@ -1176,6 +1185,12 @@ pub fn run_demo(grace_secs: u64) -> io::Result<()> {
     if observer.supervisor.state_of(entry.pid) != Some(crate::state::State::Observing) {
         return Err(io::Error::other("live reconnect did not cancel grace"));
     }
+    if first_grace_started.elapsed() < Duration::from_secs(grace_secs) {
+        return Err(io::Error::other(
+            "first grace elapsed less than requested wall time",
+        ));
+    }
+    emit_monotonic("reconnect_cancel", monotonic_origin);
     emit_step(
         12,
         "real authenticated reconnect cancelled grace in observer cycle",
@@ -1203,6 +1218,7 @@ pub fn run_demo(grace_secs: u64) -> io::Result<()> {
         )));
     }
     let second_grace_started = std::time::Instant::now();
+    emit_monotonic("grace2_start", monotonic_origin);
     emit_step(
         14,
         &format!("observer armed a fresh full {grace_secs}s grace after cancellation"),
@@ -1214,6 +1230,7 @@ pub fn run_demo(grace_secs: u64) -> io::Result<()> {
             "second grace wall duration was shorter than requested",
         ));
     }
+    emit_monotonic("grace2_expiry", monotonic_origin);
     observer.cycle()?;
     if observer.supervisor.state_of(entry.pid) != Some(crate::state::State::ReadyForRevalidation) {
         return Err(io::Error::other(
@@ -1248,6 +1265,7 @@ pub fn run_demo(grace_secs: u64) -> io::Result<()> {
             "observer-driven official close did not reap demo service",
         ));
     }
+    emit_monotonic("official_close", monotonic_origin);
     emit_step(
         16,
         "observer authorized service-owned official shutdown endpoint",

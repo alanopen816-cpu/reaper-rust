@@ -245,6 +245,18 @@ fn observer_drives_short_grace_reconnect_cycle_and_closes_only_demo() {
             "missing step {step}: {report}"
         );
     }
+    for event in [
+        "TIME grace1_start=",
+        "TIME reconnect_cancel=",
+        "TIME grace2_start=",
+        "TIME grace2_expiry=",
+        "TIME official_close=",
+    ] {
+        assert!(
+            report.contains(event),
+            "missing monotonic timestamp {event}"
+        );
+    }
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", sentinel.0)).unwrap();
     let end = stat.rfind(')').unwrap();
     let ticks: u64 = stat[end + 1..]
