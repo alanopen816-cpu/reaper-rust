@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.8.0-runtime-autonomy — 2026-10-14 (branch `feature/reaper-v0.8`, base `feature/reaper-v0.7@f9dbf34`)
+
+Runtime integration: discovery → classification → evidence → policy →
+durable state → real grace → lab-only safe termination, persistent across
+restarts. Still dry-run in production; 12 rules HOLD plus 3 audit FLAGs
+closed (full-tuple identity, FreshApproval token, durability proof).
+
+Benchmarks v0.7 → v0.8 (measured on-device):
+
+| Metric | v0.7 | v0.8 |
+|---|---|---|
+| Fast Scan wall | <1 s (7–38 ms scan) | 30 ms wall, 0 spawns, 0 errors |
+| Deep Inspection | bounded 35 s | bounded 35 s (kept, coalescing scheduler) |
+| Tests default / tui | 111 / 124 | 148 (143+1+2+2) / 165 (160+1+2+2), none deleted |
+| Release default | 1175848 B | 1285024 B (+9%) |
+| Release tui | 1809856 B | 1919952 B (+6%) |
+| Supervisor idle | ~0.4% core, ~5.3 MB debug | unchanged path (singleton pidfile added) |
+| Logs/state | 180 KB bounded daily | rotation/retention/size caps + 1 MiB state refusal |
+
+Added:
+- V8-T2 classification wired into Observer::cycle (class→tier before
+  policy, Absolute invariant under misclassification; spoof/PPID-1/ancient
+  stay safe on the real path).
+- V8-T3 durable state (versioned schema, strict parse, torn/corrupt
+  explicit errors, 0600, full identity validation, logged Results,
+  full-new-grace on reload per restart rule).
+- V8-T4 two-grade evidence (candidate_for_grace entry-only + full
+  proven() readiness-only; proven() byte-identical — resolves the
+  grace-entry deadlock) with expiry revalidation + honest cancel reasons.
+- V8-T5 controlled CoverageProof issuance (private fields, test-only
+  issuer, TTL/identity/invalidation → Unknown; no production issuer).
+- V8-T6 autonomous loop (observer.pid singleton, identity-keyed
+  appear/change/disappear diffing, coalescing DeepScheduler, Fast
+  never blocked).
+- V8-T7 lab termination pipeline (recomputed — never caller-supplied —
+  approval, 7-refusal matrix with persisted JSONL receipts, fresh
+  evidence at final gate, mid-close→revalidation-only, lab-owned only).
+- V8-T8 four live labs (elapsed-grace restart, TTL expiry, 2-project
+  isolation, vanishing-mid-close) + full 20-scenario inventory.
+- V8-T9 debts (OpenCode child-reap /proc test, metric source labels,
+  log/state caps, ADB/root guard, TUI unavailable-with-reason).
+- V8-T10 hardening (full-tuple pre-signal checks, FreshApproval token
+  type, receipt+dir fsync proof; RED caught official-shutdown-before-
+  token-check ordering bug, fixed).
+
+Verified: fmt, clippy ×2, tests ×2, release builds ×2, all labs incl.
+gated live-server, regression matrix, TUI smokes, zero strays,
+production untouched. Independent audit: 12 HOLD; adversarial sketches
+(spoof, stale cache, dropped handle, second supervisor, bypass) all
+blocked; allows review clean (dead_code + 2 style); loopback-only net.
+
+Known limits: classic kill() TOCTOU inherent (pidfd preferred);
+OpenCode in-flight child kill missing (waits bounded); TUI lifecycle
+display needs snapshot motor plumbing; discovery/disconnect partly
+fixture-driven in autonomy lab; /proc/net/* denied; bare
+`cargo test client_coverage` matches zero (use --test); linker
+"Pointer tag truncated" + TTL-timing flakes recorded (retry green).
+
+Real-pilot conditions: presence signal + human review + RDD; CompleteVerified
+unreachable in production by construction; close --act provably
+unreachable without lab membership + full proof + fresh approval.
+
 ## v0.7.0-perf-coverage-tui — 2026-10-14 (branch `feature/reaper-v0.7`, base `feature/client-tracking-tui@7567405`)
 
 Fast supervisor/TUI scans, verifiable client-coverage contract, real per-process
