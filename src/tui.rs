@@ -1054,4 +1054,71 @@ mod tests {
         let _ = fast_snapshot();
         assert!(started.elapsed() < Duration::from_secs(5));
     }
+
+    #[test]
+    fn two_tui_instances_share_snapshot_and_second_supervisor_rejected() {
+        // Lock-in: TUI instances are observer-only. Two UI states over one
+        // shared snapshot stay consistent, and the pilot pidfile
+        // supervisor-singleton guard rejects a second supervisor.
+        let snap = fixture();
+        assert!(
+            snap.supervisor.contains("observer"),
+            "TUI snapshot must stay observer-only, got: {}",
+            snap.supervisor
+        );
+        let rows_before = snap.rows.len();
+
+        // Two independent UI states over the same shared snapshot source.
+        let first = UiState::default();
+        let mut second = UiState::default();
+        let mut term_a = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut term_b = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term_a.draw(|f| render(f, &first, &snap)).unwrap();
+        term_b.draw(|f| render(f, &first, &snap)).unwrap();
+        assert_eq!(term_a.backend().buffer(), term_b.backend().buffer());
+
+        // Navigating/sorting the second instance never mutates the shared
+        // snapshot (no duplicated supervision) nor the first instance.
+        second.handle(Key::Down, snap.rows.len());
+        second.handle(Key::Sort, snap.rows.len());
+        assert_eq!(snap.rows.len(), rows_before);
+        assert!(snap.supervisor.contains("observer"));
+        assert_eq!(first.selected, 0);
+        assert_eq!(second.selected, 1);
+        assert_eq!(second.sort, Sort::Swap);
+        term_b.draw(|f| render(f, &second, &snap)).unwrap();
+
+        // Supervisor-singleton guard: a live pidfile holder rejects a second
+        // supervisor. Craft a live-but-unverified record (self pid, impossible
+        // start_ticks) so `start` must refuse without spawning anything.
+        let dir = std::env::temp_dir().join(format!(
+            "reaper-multi-tui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pilot.pid");
+        let record = format!(
+            "{{\"pid\":{},\"start_ticks\":{}}}\n",
+            std::process::id(),
+            u64::MAX
+        );
+        std::fs::write(&pidfile, &record).unwrap();
+        let err = crate::pilot::start(&dir, 30)
+            .expect_err("second supervisor must be rejected while a live pidfile holder exists");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::AlreadyExists
+            ),
+            "unexpected rejection kind: {}",
+            err
+        );
+        // The guard must not overwrite the existing holder's pidfile.
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), record);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
