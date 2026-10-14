@@ -340,6 +340,11 @@ fn clock_ticks_per_second() -> (u64, bool) {
     }
 }
 
+fn discovered_clock_ticks() -> Option<u64> {
+    let (hz, estimated) = clock_ticks_per_second();
+    (!estimated).then_some(hz)
+}
+
 fn self_cpu_percent(hz: u64) -> Option<f64> {
     let sample = crate::stats::self_usage();
     static PREVIOUS: std::sync::OnceLock<std::sync::Mutex<Option<(u64, Instant)>>> =
@@ -477,14 +482,13 @@ fn show_swap_cpu(width: u16) -> bool {
     width >= 60
 }
 
-fn uptime_seconds(start_ticks: u64) -> u64 {
-    let hz = 100u64;
+/// Process uptime is exact only when CLK_TCK was discovered and procfs is readable.
+fn uptime_seconds(start_ticks: u64, hz: Option<u64>) -> Option<u64> {
+    let hz = hz.filter(|hz| *hz > 0)?;
     let uptime = std::fs::read_to_string("/proc/uptime")
         .ok()
         .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
-    uptime
-        .map(|s| (s.max(0.0) as u64).saturating_sub(start_ticks / hz))
-        .unwrap_or(0)
+    uptime.map(|s| (s.max(0.0) as u64).saturating_sub(start_ticks / hz))
 }
 
 fn client_label(state: &str) -> String {
@@ -625,7 +629,11 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
                     Cell::from(p.rss_kib.to_string()),
                     Cell::from(p.swap_kib.to_string()),
                     Cell::from(p.state.to_string()),
-                    Cell::from(format!("{}s", uptime_seconds(p.start_ticks))),
+                    Cell::from(
+                        uptime_seconds(p.start_ticks, discovered_clock_ticks())
+                            .map(|seconds| format!("{seconds}s"))
+                            .unwrap_or_else(|| "— est.".into()),
+                    ),
                     Cell::from(client_label(&r.client_state)),
                 ];
                 cells.push(Cell::from(format!("{:?}", r.tier)));
@@ -705,7 +713,9 @@ fn render(frame: &mut Frame, state: &UiState, snap: &Snapshot) {
             chunks[0],
         );
     }
-    let status = format!("↑↓ navigate / search Enter detail t tree s sort l events c clients e evidence ? help r refresh q quit | visible={} protected={} observed={} candidate={} ownCPU={} supervisor={} RAM={} swap={} skippedRefreshes={}", snap.rows.len(), snap.rows.iter().filter(|r| r.tier != Tier::Unknown).count(), snap.rows.len(), snap.rows.iter().filter(|r| r.blocks.is_empty() && r.tier == Tier::Known).count(), snap.self_cpu.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "—".into()), snap.supervisor, snap.ram.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()), snap.swap.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()), snap.refresh_skipped);
+    // The observer snapshot has no motor decision, grace timer, or supervisor
+    // decision stream. Never infer candidate counts from protection/block heuristics.
+    let status = format!("↑↓ navigate / search Enter detail t tree s sort l events c clients e evidence ? help r refresh q quit | visible={} protected={} observed={} candidate=unavailable(snapshot has no motor decisions) ownCPU={} supervisor={} RAM={} swap={} skippedRefreshes={} grace=unavailable decision=unavailable", snap.rows.len(), snap.rows.iter().filter(|r| r.tier != Tier::Unknown).count(), snap.rows.len(), snap.self_cpu.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "—".into()), snap.supervisor, snap.ram.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()), snap.swap.map(|(a,b)| format!("{a}/{b}KiB")).unwrap_or_else(|| "unavailable".into()), snap.refresh_skipped);
     frame.render_widget(Paragraph::new(status), chunks[chunks.len() - 1]);
 }
 
@@ -953,6 +963,33 @@ mod tests {
             cpu_percent(Some(previous), 1, 125, at + Duration::from_secs(1), 250),
             Some(10.0)
         );
+    }
+
+    #[test]
+    fn uptime_requires_discovered_tick_rate_and_procfs_source() {
+        assert_eq!(uptime_seconds(100, None), None);
+        assert_eq!(
+            uptime_seconds(0, Some(100)).is_some(),
+            std::fs::read_to_string("/proc/uptime").is_ok()
+        );
+    }
+
+    #[test]
+    fn candidate_metric_is_explicitly_unavailable_without_motor_decisions() {
+        let backend = ratatui::backend::TestBackend::new(400, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, &UiState::default(), &fixture()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("candidate=unavailable"));
+        assert!(text.contains("grace=unavailable"));
     }
 
     #[test]
