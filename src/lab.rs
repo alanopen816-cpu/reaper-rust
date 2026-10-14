@@ -1,4 +1,6 @@
 //! Lab-only child registry. No arbitrary PID input is accepted for cleanup.
+#[path = "lab_autonomy.rs"]
+mod autonomy;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
