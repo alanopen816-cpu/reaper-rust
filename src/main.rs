@@ -1083,6 +1083,15 @@ fn cmd_observe(
             return Err(e);
         }
     };
+    if let Some(recovery) = supervisor.recovery_message() {
+        let _ = logx::log(
+            &log_cfg,
+            logx::Level::Warn,
+            "state.recovered_fresh",
+            recovery,
+        );
+        eprintln!("state recovery: {recovery}; observer continues with fresh state");
+    }
     let usage_start = stats::self_usage();
     logx::log(&log_cfg, logx::Level::Info, "observer.started",
         &format!("read_only=true recovered={kept} discarded_recycled={discarded} pidfd={} interval={interval}",

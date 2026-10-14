@@ -40,6 +40,50 @@ fn invalid_state(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
+fn archive_invalid_state(path: &Path) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup = path.with_file_name(format!(
+        "{}.bak.{stamp}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    if let Err(error) = fs::rename(path, &backup) {
+        return format!("backup_failed={error}; fresh_state_write_skipped; continuing_in_memory");
+    }
+    let mut archived = format!("backup={}", backup.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)) {
+            archived.push_str(&format!("; backup_permissions_failed={error}"));
+        }
+    }
+    let fresh = (|| -> std::io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        use std::io::Write;
+        writeln!(file, "{SCHEMA_VERSION}")?;
+        file.sync_all()
+    })();
+    match fresh {
+        Ok(()) => format!("{archived}; fresh_state=true"),
+        Err(error) => format!("{archived}; fresh_state_write_failed={error}; continuing_in_memory"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Discovered,
@@ -122,6 +166,7 @@ struct Entry {
 pub struct Supervisor {
     entries: HashMap<u32, Entry>,
     state_file: PathBuf,
+    recovery_message: Option<String>,
 }
 
 impl Supervisor {
@@ -129,11 +174,16 @@ impl Supervisor {
         Supervisor {
             entries: HashMap::new(),
             state_file,
+            recovery_message: None,
         }
     }
 
     pub fn state_of(&self, pid: u32) -> Option<State> {
         self.entries.get(&pid).map(|e| e.state)
+    }
+
+    pub fn recovery_message(&self) -> Option<&str> {
+        self.recovery_message.as_deref()
     }
 
     /// Stored identity for a tracked PID (used to detect PID recycling via
@@ -308,82 +358,106 @@ impl Supervisor {
             .lock()
             .map_err(|_| std::io::Error::other("state lock poisoned"))?;
         self.state_file = state_file.to_path_buf();
+        self.recovery_message = None;
         let content = match fs::read_to_string(&self.state_file) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-            Err(e) => return Err(e),
+            Err(e) => {
+                self.entries.clear();
+                self.recovery_message = Some(format!(
+                    "state unreadable ({e}); {}",
+                    archive_invalid_state(&self.state_file)
+                ));
+                return Ok((0, 0));
+            }
         };
         let mut lines = content.lines();
         if lines.next() != Some(SCHEMA_VERSION) {
-            return Err(invalid_state("missing or unsupported state schema version"));
+            self.entries.clear();
+            self.recovery_message = Some(format!(
+                "state schema missing or unsupported; {}",
+                archive_invalid_state(&self.state_file)
+            ));
+            return Ok((0, 0));
         }
         let mut kept = 0;
         let mut discarded = 0;
         self.entries.clear();
-        for line in lines {
-            let fields: Vec<_> = line.split('\t').collect();
-            if fields.len() != 11 {
-                return Err(invalid_state("incomplete state record"));
-            }
-            let pid: u32 = fields[0]
-                .parse()
-                .map_err(|_| invalid_state("invalid pid"))?;
-            let start: u64 = fields[1]
-                .parse()
-                .map_err(|_| invalid_state("invalid start time"))?;
-            let uid = if fields[2] == "-" {
-                None
-            } else {
-                Some(
-                    fields[2]
-                        .parse()
-                        .map_err(|_| invalid_state("invalid uid"))?,
-                )
-            };
-            let state =
-                State::parse(fields[3]).ok_or_else(|| invalid_state("invalid lifecycle state"))?;
-            let boot = unhex(fields[6])?;
-            let exe = unhex(fields[7])?;
-            let reason = unhex(fields[8])?;
-            let evidence = unhex(fields[9])?;
-            let policy = unhex(fields[10])?;
-            match live.get(&pid) {
-                Some(live_identity)
-                    if live_identity.start_ticks == start
-                        && live_identity.uid == uid
-                        && live_identity.boot_id.as_deref().unwrap_or("") == boot
-                        && live_identity.exe == exe =>
-                {
-                    // Downtime invalidates monotonic clocks and cannot prove grace elapsed.
-                    // Reconstruct from the current wall anchor only to expose a new deadline;
-                    // a caller must obtain fresh evidence before treating it as actionable.
-                    let deadline = if state == State::GracePeriod {
-                        Some(now_unix + grace_secs)
-                    } else {
-                        None
-                    };
-                    self.entries.insert(
-                        pid,
-                        Entry {
-                            identity: ProcessIdentity {
-                                boot_id: live_identity.boot_id.clone(),
-                                pid,
-                                start_ticks: start,
-                                uid: live_identity.uid,
-                                exe,
-                            },
-                            state,
-                            grace_deadline: deadline,
-                            reason,
-                            evidence,
-                            policy,
-                            grace_start_wall: Some(now_unix),
-                        },
-                    );
-                    kept += 1;
+        let parsed = (|| -> std::io::Result<()> {
+            for line in lines {
+                let fields: Vec<_> = line.split('\t').collect();
+                if fields.len() != 11 {
+                    return Err(invalid_state("incomplete state record"));
                 }
-                _ => discarded += 1,
+                let pid: u32 = fields[0]
+                    .parse()
+                    .map_err(|_| invalid_state("invalid pid"))?;
+                let start: u64 = fields[1]
+                    .parse()
+                    .map_err(|_| invalid_state("invalid start time"))?;
+                let uid = if fields[2] == "-" {
+                    None
+                } else {
+                    Some(
+                        fields[2]
+                            .parse()
+                            .map_err(|_| invalid_state("invalid uid"))?,
+                    )
+                };
+                let state = State::parse(fields[3])
+                    .ok_or_else(|| invalid_state("invalid lifecycle state"))?;
+                let boot = unhex(fields[6])?;
+                let exe = unhex(fields[7])?;
+                let reason = unhex(fields[8])?;
+                let evidence = unhex(fields[9])?;
+                let policy = unhex(fields[10])?;
+                match live.get(&pid) {
+                    Some(live_identity)
+                        if live_identity.start_ticks == start
+                            && live_identity.uid == uid
+                            && live_identity.boot_id.as_deref().unwrap_or("") == boot
+                            && live_identity.exe == exe =>
+                    {
+                        // Downtime invalidates monotonic clocks and cannot prove grace elapsed.
+                        // Reconstruct from the current wall anchor only to expose a new deadline;
+                        // a caller must obtain fresh evidence before treating it as actionable.
+                        let deadline = if state == State::GracePeriod {
+                            Some(now_unix + grace_secs)
+                        } else {
+                            None
+                        };
+                        self.entries.insert(
+                            pid,
+                            Entry {
+                                identity: ProcessIdentity {
+                                    boot_id: live_identity.boot_id.clone(),
+                                    pid,
+                                    start_ticks: start,
+                                    uid: live_identity.uid,
+                                    exe,
+                                },
+                                state,
+                                grace_deadline: deadline,
+                                reason,
+                                evidence,
+                                policy,
+                                grace_start_wall: Some(now_unix),
+                            },
+                        );
+                        kept += 1;
+                    }
+                    _ => discarded += 1,
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = parsed {
+            self.entries.clear();
+            self.recovery_message = Some(format!(
+                "state corrupt ({error}); {}",
+                archive_invalid_state(&self.state_file)
+            ));
+            return Ok((0, 0));
         }
         Ok((kept, discarded))
     }
@@ -484,14 +558,84 @@ mod tests {
     }
 
     #[test]
-    fn malformed_state_is_reported_instead_of_treated_as_empty() {
+    fn malformed_state_is_archived_and_recovered_fresh() {
         let dir = std::env::temp_dir().join(format!("reaper-corrupt-state-{}", std::process::id()));
         let file = dir.join("state.json");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&file, "not a state file\n").unwrap();
         let mut supervisor = Supervisor::new(file.clone());
         let live = HashMap::new();
-        assert!(supervisor.reload(&live, 1, 600, &file).is_err());
+        assert_eq!(supervisor.reload(&live, 1, 600, &file).unwrap(), (0, 0));
+        assert!(supervisor
+            .recovery_message()
+            .unwrap()
+            .contains("state schema missing"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_corrupt_and_unknown_schema_files_recover_fresh_with_private_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("reaper-state-recovery-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for (index, contents) in [
+            "legacy state\n",
+            "REAPER_STATE_V1\nnot\ta\tvalid\trecord\n",
+            "REAPER_STATE_V0\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = dir.join(format!("state-{index}.json"));
+            fs::write(&file, contents).unwrap();
+            let mut supervisor = Supervisor::new(file.clone());
+            assert_eq!(
+                supervisor.reload(&HashMap::new(), 10, 600, &file).unwrap(),
+                (0, 0)
+            );
+            assert!(
+                supervisor.entries.is_empty(),
+                "recovery must not restore candidates or grace"
+            );
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                format!("{SCHEMA_VERSION}\n")
+            );
+            assert_eq!(
+                fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|e| e
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("state-{index}.json.bak.")))
+                    .count(),
+                1
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let backup = fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(&format!("state-{index}.json.bak."))
+                    })
+                    .unwrap()
+                    .path();
+                assert_eq!(
+                    fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                assert_eq!(
+                    fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -502,19 +646,37 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(&file, "REAPER_STATE_V0\n").unwrap();
         let mut supervisor = Supervisor::new(file.clone());
-        assert!(supervisor.reload(&HashMap::new(), 10, 600, &file).is_err());
+        assert_eq!(
+            supervisor.reload(&HashMap::new(), 10, 600, &file).unwrap(),
+            (0, 0)
+        );
+        assert!(supervisor
+            .recovery_message()
+            .unwrap()
+            .contains("unsupported"));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn torn_record_is_an_error_and_does_not_restore_partial_state() {
+    fn torn_record_is_archived_without_restoring_partial_state() {
         let dir = std::env::temp_dir().join(format!("reaper-torn-test-{}", std::process::id()));
         let file = dir.join("state.json");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&file, format!("{SCHEMA_VERSION}\n12\t")).unwrap();
         let mut supervisor = Supervisor::new(file.clone());
-        assert!(supervisor.reload(&HashMap::new(), 10, 600, &file).is_err());
+        assert_eq!(
+            supervisor.reload(&HashMap::new(), 10, 600, &file).unwrap(),
+            (0, 0)
+        );
         assert_eq!(supervisor.state_of(12), None);
+        assert!(supervisor
+            .recovery_message()
+            .unwrap()
+            .contains("state corrupt"));
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            format!("{SCHEMA_VERSION}\n")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

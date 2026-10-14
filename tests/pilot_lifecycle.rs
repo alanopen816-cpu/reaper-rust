@@ -123,6 +123,7 @@ fn pilot_smoke_runs_a_bounded_number_of_read_only_cycles() {
 fn pilot_source_has_no_wakelock_api_and_read_only_guards_actuation() {
     let main = fs::read_to_string("src/main.rs").unwrap();
     let pilot = fs::read_to_string("src/pilot.rs").unwrap();
+    let state = fs::read_to_string("src/state.rs").unwrap();
     for forbidden in ["WakeLock", "PartialWakeLock", "acquireWakeLock"] {
         assert!(!main.contains(forbidden), "main.rs contains {forbidden}");
         assert!(!pilot.contains(forbidden), "pilot.rs contains {forbidden}");
@@ -130,4 +131,54 @@ fn pilot_source_has_no_wakelock_api_and_read_only_guards_actuation() {
     assert!(main.contains("PILOT_READ_ONLY.load"));
     assert!(main.contains("--pilot-read-only"));
     assert!(main.contains("!PILOT_READ_ONLY.load") && main.contains("schedule_deep_targets"));
+    assert!(main.contains("state.recovered_fresh"));
+    assert!(!state.contains("missing or unsupported state schema version"));
+}
+
+#[test]
+fn observer_recovers_legacy_state_and_keeps_running() {
+    let home = isolated_state();
+    let state = home.join("state/reaper");
+    fs::create_dir_all(&state).unwrap();
+    let state_file = state.join("supervisor.json");
+    fs::write(&state_file, "legacy pre-schema state\n").unwrap();
+    let started = invoke(&home, &["pilot", "start", "--interval", "5"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let mut running = false;
+    let mut backed_up = false;
+    for _ in 0..30 {
+        let status = invoke(&home, &["pilot", "status"]);
+        running = String::from_utf8_lossy(&status.stdout).contains("pilot running");
+        backed_up = fs::read_dir(&state).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("supervisor.json.bak.")
+        });
+        if running && backed_up {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let fresh = fs::read_to_string(&state_file)
+        .unwrap_or_default()
+        .starts_with("REAPER_STATE_V1\n");
+    let stopped = invoke(&home, &["pilot", "stop"]);
+    assert!(
+        running,
+        "observer exited after state recovery: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(backed_up, "legacy state was not backed up");
+    assert!(fresh, "fresh schema state was not installed");
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let _ = fs::remove_dir_all(home);
 }
