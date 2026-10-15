@@ -268,6 +268,11 @@ impl PidfdSignaller {
 }
 
 fn tuple_matches(pid: u32, ticks: u64, expected: &FreshApproval) -> bool {
+    if crate::identity::verify_identity(pid, ticks, Some(expected.uid))
+        != crate::identity::IdentityVerification::Verified
+    {
+        return false;
+    }
     match read_process_tuple(pid) {
         Ok(actual) => {
             let matches = actual.pid == expected.pid

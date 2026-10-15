@@ -12,6 +12,57 @@ use crate::owner::OwnerVerdict;
 use crate::procfs::Process;
 use crate::relations::Relations;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum IdentityVerification {
+    Verified,
+    Mismatch,
+    Gone,
+    PermissionUnknown,
+}
+
+/// Verify PID, proc stat field 22 (starttime), proc ownership, and executable.
+/// This narrows PID reuse risk but cannot remove the check-vs-signal TOCTOU race;
+/// pidfd can bind later signal delivery to the opened process, when supported.
+#[allow(dead_code)]
+pub fn verify_identity(pid: u32, start_ticks: u64, uid: Option<u32>) -> IdentityVerification {
+    let base = format!("/proc/{pid}");
+    let stat = match fs::read_to_string(format!("{base}/stat")) {
+        Ok(stat) => stat,
+        Err(error) => return classify_proc_error(&error),
+    };
+    let Some((actual_pid, _, _, _, _, _, actual_ticks)) = crate::procfs::parse_stat(&stat) else {
+        return IdentityVerification::PermissionUnknown;
+    };
+    let owner = match fs::metadata(&base) {
+        Ok(metadata) => metadata.uid(),
+        Err(error) => return classify_proc_error(&error),
+    };
+    let exe = match fs::read_link(format!("{base}/exe")) {
+        Ok(exe) => exe,
+        Err(error) => return classify_proc_error(&error),
+    };
+    if actual_pid == pid
+        && actual_ticks == start_ticks
+        && uid == Some(owner)
+        && !exe.as_os_str().is_empty()
+    {
+        IdentityVerification::Verified
+    } else {
+        IdentityVerification::Mismatch
+    }
+}
+
+#[allow(dead_code)]
+fn classify_proc_error(error: &std::io::Error) -> IdentityVerification {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => IdentityVerification::Gone,
+        std::io::ErrorKind::PermissionDenied => IdentityVerification::PermissionUnknown,
+        _ => IdentityVerification::PermissionUnknown,
+    }
+}
 
 /// General process role. A role is descriptive evidence, never authority to act.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -288,6 +339,27 @@ mod tests {
         let known = identify(&proc(4242, 100, Some(10373)), boot);
         // Same PID, new start time => recycled => must NOT verify.
         assert!(!verify(&known, &proc(4242, 101, Some(10373))));
+    }
+
+    #[test]
+    fn live_identity_rejects_fake_recycled_start_ticks() {
+        let pid = std::process::id();
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("current proc stat");
+        let ticks = crate::procfs::parse_stat(&stat)
+            .expect("parse current stat")
+            .6;
+        assert_eq!(
+            verify_identity(pid, ticks.wrapping_add(1), None),
+            IdentityVerification::Mismatch
+        );
+    }
+
+    #[test]
+    fn nonexistent_pid_is_gone() {
+        assert_eq!(
+            verify_identity(u32::MAX, 0, None),
+            IdentityVerification::Gone
+        );
     }
 
     #[test]
