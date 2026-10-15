@@ -672,6 +672,22 @@ fn store_record(path: &Path, record: PilotProcess) -> io::Result<()> {
 
 pub fn start(state_dir: &Path, interval: u64) -> io::Result<()> {
     fs::create_dir_all(state_dir)?;
+    let observer_path = state_dir.join("observer.pid");
+    if observer_path.exists() {
+        let occupied = match read_record(&observer_path) {
+            Ok(record) => {
+                process_start_ticks(record.pid).ok() == Some(record.start_ticks)
+                    || process_exists(record.pid)
+            }
+            Err(_) => true,
+        };
+        if occupied {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "observer already running or pidfile is unverifiable",
+            ));
+        }
+    }
     let path = pidfile(state_dir);
     if path.exists() {
         match read_record(&path) {

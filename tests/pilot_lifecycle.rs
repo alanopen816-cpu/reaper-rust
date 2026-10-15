@@ -105,6 +105,44 @@ fn stale_pidfile_is_replaced_and_foreign_pidfile_is_preserved_on_stop() {
 }
 
 #[test]
+fn start_refuses_when_an_observer_already_holds_its_pidfile() {
+    let home = isolated_state();
+    let state = home.join("state/reaper");
+    fs::create_dir_all(&state).unwrap();
+    let start_ticks = fs::read_to_string(format!("/proc/{}/stat", std::process::id()))
+        .unwrap()
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    fs::write(
+        state.join("observer.pid"),
+        format!(
+            "{{\"pid\":{},\"start_ticks\":{start_ticks}}}\n",
+            std::process::id()
+        ),
+    )
+    .unwrap();
+
+    let started = invoke(&home, &["pilot", "start", "--interval", "5"]);
+    assert!(
+        !started.status.success(),
+        "start ran beside a live observer"
+    );
+    assert!(
+        String::from_utf8_lossy(&started.stderr).contains("observer already running"),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(!pidfile(&home).exists(), "pilot pidfile was installed");
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn pilot_smoke_runs_a_bounded_number_of_read_only_cycles() {
     let home = isolated_state();
     let output = invoke(&home, &["pilot", "smoke", "2"]);
