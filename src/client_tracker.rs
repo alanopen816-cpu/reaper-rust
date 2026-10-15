@@ -57,6 +57,159 @@ pub struct Registry {
     pub clients: Vec<ClientRecord>,
 }
 
+/// A cooperative client lease. A lease records liveness claims, not proof of
+/// complete client coverage or permission to terminate a service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct LeaseRecord {
+    pub client_id: String,
+    pub service_id: String,
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub nonce: String,
+    pub issued_at: u64,
+    pub ttl_secs: u64,
+    pub explicit_disconnect: bool,
+    /// `None` means work state is unknown; only demonstrated evidence may set it.
+    pub active_work_evidence: Option<bool>,
+    pub needs_reconciliation: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum LeaseKnowledge {
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum LeaseStatus {
+    Active,
+    ExpiredNeedsReconcile(LeaseKnowledge),
+    Disconnected,
+    Inconsistent(LeaseKnowledge),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct LeaseRegistry {
+    pub leases: Vec<LeaseRecord>,
+    pub default_ttl_secs: u64,
+}
+
+#[allow(dead_code)]
+impl LeaseRegistry {
+    pub fn new(default_ttl_secs: u64) -> Self {
+        Self {
+            leases: Vec::new(),
+            default_ttl_secs,
+        }
+    }
+
+    pub fn register(
+        &mut self,
+        client_id: &str,
+        service_id: &str,
+        pid: u32,
+        start_ticks: u64,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<&LeaseRecord, &'static str> {
+        if client_id.is_empty() || service_id.is_empty() || pid == 0 || start_ticks == 0 {
+            return Err("invalid lease identity");
+        }
+        if self.leases.iter().any(|lease| lease.client_id == client_id) {
+            return Err("client already registered");
+        }
+        self.leases.push(LeaseRecord {
+            client_id: client_id.into(),
+            service_id: service_id.into(),
+            pid,
+            start_ticks,
+            nonce: nonce(),
+            issued_at: now,
+            ttl_secs: if ttl_secs == 0 {
+                self.default_ttl_secs
+            } else {
+                ttl_secs
+            },
+            explicit_disconnect: false,
+            active_work_evidence: None,
+            needs_reconciliation: false,
+        });
+        Ok(self.leases.last().unwrap())
+    }
+
+    /// PID + starttime revalidation narrows reuse risk but remains TOCTOU: the
+    /// process can change after this check. SO_PEERCRED authenticates a socket
+    /// peer's kernel credentials, not the client's application-level identity.
+    pub fn renew(
+        &mut self,
+        client_id: &str,
+        now: u64,
+        live_start_ticks: impl FnOnce(u32) -> Option<u64>,
+    ) -> LeaseStatus {
+        let Some(lease) = self.leases.iter_mut().find(|l| l.client_id == client_id) else {
+            return LeaseStatus::Inconsistent(LeaseKnowledge::Unknown);
+        };
+        if live_start_ticks(lease.pid) != Some(lease.start_ticks) {
+            lease.needs_reconciliation = true;
+            return LeaseStatus::Inconsistent(LeaseKnowledge::Unknown);
+        }
+        lease.issued_at = now;
+        lease.explicit_disconnect = false;
+        lease.needs_reconciliation = false;
+        LeaseStatus::Active
+    }
+
+    pub fn unregister(&mut self, client_id: &str) -> bool {
+        let Some(lease) = self
+            .leases
+            .iter_mut()
+            .find(|lease| lease.client_id == client_id)
+        else {
+            return false;
+        };
+        if lease.explicit_disconnect {
+            return false;
+        }
+        lease.explicit_disconnect = true;
+        lease.needs_reconciliation = false;
+        true
+    }
+
+    pub fn expired(&mut self, now: u64) -> Vec<&LeaseRecord> {
+        for lease in &mut self.leases {
+            if lease.explicit_disconnect
+                || now < lease.issued_at
+                || now.saturating_sub(lease.issued_at) >= lease.ttl_secs
+            {
+                lease.needs_reconciliation = !lease.explicit_disconnect;
+            }
+        }
+        self.leases
+            .iter()
+            .filter(|l| l.needs_reconciliation)
+            .collect()
+    }
+
+    pub fn status(&self, client_id: &str, now: u64) -> LeaseStatus {
+        let Some(lease) = self.leases.iter().find(|l| l.client_id == client_id) else {
+            return LeaseStatus::Inconsistent(LeaseKnowledge::Unknown);
+        };
+        if lease.explicit_disconnect {
+            LeaseStatus::Disconnected
+        } else if lease.needs_reconciliation
+            || now < lease.issued_at
+            || now.saturating_sub(lease.issued_at) >= lease.ttl_secs
+        {
+            LeaseStatus::ExpiredNeedsReconcile(LeaseKnowledge::Unknown)
+        } else {
+            LeaseStatus::Active
+        }
+    }
+}
+
 /// How much of the client population can be safely reasoned about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coverage {
@@ -571,6 +724,54 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn lease_lifecycle_is_conservative_on_expiry_and_identity_mismatch() {
+        let mut registry = LeaseRegistry::new(1_800);
+        let lease = registry
+            .register("client-a", "service-a", 42, 900, 100, 0)
+            .unwrap();
+        assert_eq!(lease.ttl_secs, 1_800);
+        assert_eq!(registry.status("client-a", 101), LeaseStatus::Active);
+        assert_eq!(
+            registry.renew("client-a", 102, |_| Some(900)),
+            LeaseStatus::Active
+        );
+        assert_eq!(
+            registry.renew("client-a", 103, |_| Some(901)),
+            LeaseStatus::Inconsistent(LeaseKnowledge::Unknown)
+        );
+        assert_eq!(
+            registry.status("client-a", 103),
+            LeaseStatus::ExpiredNeedsReconcile(LeaseKnowledge::Unknown)
+        );
+        assert_eq!(registry.expired(103).len(), 1);
+        assert!(registry.unregister("client-a"));
+        assert_eq!(registry.status("client-a", 103), LeaseStatus::Disconnected);
+        assert!(!registry.unregister("client-a"));
+    }
+
+    #[test]
+    fn lease_expiry_and_empty_registry_never_prove_completion() {
+        let mut registry = LeaseRegistry::new(10);
+        assert_eq!(
+            registry.status("missing", 100),
+            LeaseStatus::Inconsistent(LeaseKnowledge::Unknown)
+        );
+        registry
+            .register("client-a", "service-a", 42, 900, 100, 10)
+            .unwrap();
+        assert_eq!(
+            registry.status("client-a", 110),
+            LeaseStatus::ExpiredNeedsReconcile(LeaseKnowledge::Unknown)
+        );
+        assert!(registry.expired(110)[0].needs_reconciliation);
+        assert!(registry
+            .leases
+            .iter()
+            .all(|lease| lease.active_work_evidence.is_none()));
+        assert_eq!(coverage(), Coverage::Unknown);
+    }
     fn lab_dir(label: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
