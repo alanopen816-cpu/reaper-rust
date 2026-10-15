@@ -9,6 +9,8 @@
 
 mod adapters;
 mod client_tracker;
+#[allow(dead_code)]
+mod dryrun;
 mod events;
 mod evidence;
 mod identity;
