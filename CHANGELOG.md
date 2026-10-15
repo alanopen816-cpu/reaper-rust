@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.9.1-security-hardening — 2026-10-15 (branch `feature/reaper-v0.9.1`, base `feature/reaper-v0.9@9bcd672`)
+
+P0 debts closed with evidence or explicit code-backed blocks; controlled
+client coverage demonstrated in the lab; 20-step demo verified 18/20
+(kernel-blocked remainder); OpenCode/Codex matrices UNFIT with evidence;
+pilot preserved read-only with a bounded partial report. Production
+never closed. 12 rules HOLD.
+
+Benchmarks v0.9 → v0.9.1 (measured on-device):
+
+| Metric | v0.9 | v0.9.1 |
+|---|---|---|
+| Fast Scan wall | 19 ms wall, 50 procs, read-only | 78 ms wall under parallel-build load (51 procs, 0 skipped, 0 errors) |
+| Deep Inspection | bounded 35 s | bounded 35 s (kept) |
+| Tests default / tui | 157+16 / 176+16 | 161+17 / 180+17 (178/197 total), none deleted |
+| Release default | 1580720 B | 1582120 B (+0.09%) |
+| Release tui | 2226400 B | 2227584 B (+0.05%) |
+| Pilot RSS | 3944 KB VmRSS | 3000 KiB, 0 CPU ticks |
+| Logs/state | 992 KB, rotation live | 1 MiB cap rotation VERIFIED live (1048575 B → rotated); ~1.4 MB total |
+| Pilot gaps | 1 × missing_cycles (build load) | 1 × 30 s missing_cycles, exact window logged, crash excluded |
+
+Added:
+- V91-T1 debt closure: durable-grant CLOSED by construction
+  (`persist()` stores observations only, "never irreversible
+  decisions"); /proc-loss pinned (`missing_fresh_scan_target_
+  explicitly_refused`); carried-input + T7-items-1-2 founded-BLOCKED
+  (no carried channel in `close_sequence`; no expiry model in
+  `ScopedAuthorization` — fixing either = scope expansion, declined).
+- V91-T2 controlled coverage: TTL `>=` boundary fix (genuine RED);
+  additive UDS-construction TRANSPORT-EVIDENCE (ATTEST bytes
+  unchanged, runtime TCP tripwire kept, production Unknown untouched);
+  bypass/event-loss/Broken-registry close-blocking tests; controlled
+  Unknown→CompleteVerified→fresh-approval transition (test-scoped
+  issuer). Round-1 swap reverted after parent-verified live-cycle
+  regression (hang >300 s vs 2.85 s baseline) — conjunction lesson.
+- V91-T6 update-time protection: `pilot start` refuses on live or
+  unverifiable observer pidfile (genuine RED→GREEN).
+- V91-T4 matrices: OpenCode + Codex UNFIT for idle verification with
+  file:line evidence; closing integrations UNKNOWN.
+- V91-T5 pilot partial: ~6.4 h elapsed, observed ≈ elapsed − 30 s,
+  ~60 rows all Blocked/KeepProtected, 0 candidates, 0 grace events.
+
+Verified: fmt, clippy ×2, tests ×2 (178/197), release builds ×2,
+gates green every step, independent audit (bypass traces blocked),
+destructive scope evidenced (kills only on self-spawned handles;
+sole raw kill is identity-verified pilot stop, no escalation).
+
+Known limits / residuals: T7-1-2 interface gaps; same-UID
+roster-attacker model unverified; demo steps 19-20 + two-client flow
++ full 20-chain blocked by denied /proc/net tables (same kernel
+precondition as CompleteVerified); binary update/rollback procedure
+missing (docs); per-cycle load telemetry deferred; uptime_seconds=0
+cosmético; linker + TTL flakes (1 retry); sentinel-stat NotFound
+transient (prod churn, retry green).
+
+First-authorized-non-lab-close requirements: kernel with readable
+listener tables (or UDS-exclusive managed service per V91-T2
+contract); full proof + fresh approval + lab membership; human
+review + RDD gates; E-Stop verified; 7-day pilot reviewed; audit GO.
+
 ## v0.9.0-operational-pilot — 2026-10-14 (branch `feature/reaper-v0.9`, base `feature/reaper-v0.8@cb436cc`)
 
 First REAL lab-owned managed service end-to-end (18-step autonomous
