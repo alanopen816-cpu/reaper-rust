@@ -191,4 +191,15 @@ mod tests {
         }
         assert_eq!(inodes, HashSet::from([8, 12]));
     }
+
+    #[test]
+    fn gone_or_identity_mismatch_never_yields_a_complete_snapshot() {
+        let gone = observe_fd_sockets(u32::MAX, None).unwrap_err();
+        assert_eq!(gone, SocketObsError::ProcessGone);
+        let reused = observe_fd_sockets(std::process::id(), Some(u64::MAX)).unwrap_err();
+        assert_eq!(reused, SocketObsError::IdentityMismatch);
+        // No snapshot is preferable to interpreting inaccessible/missing fd data
+        // as an empty set of sockets.
+        assert!(!matches!(gone, SocketObsError::Io));
+    }
 }

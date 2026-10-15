@@ -322,4 +322,97 @@ mod tests {
             1024 * 1024
         );
     }
+
+    #[test]
+    fn bypass_race_and_observation_failures_are_never_close_candidates() {
+        // The extra transport is deliberately not represented by a lease. Silence
+        // in the registry cannot promote constructionally incomplete coverage.
+        let bypass = decide(
+            1,
+            "lab",
+            7,
+            9,
+            ClientState::Unknown,
+            0,
+            0,
+            false,
+            TransportCoverage::IncompleteByConstruction,
+            1800,
+            true,
+            true,
+        );
+        assert_eq!(bypass.simulated_decision, SimulatedDecision::ProtectUnknown);
+        assert_ne!(Coverage::Unknown, Coverage::CompleteVerified);
+
+        let during_race = decide(
+            2,
+            "lab",
+            7,
+            9,
+            ClientState::Unknown,
+            0,
+            0,
+            false,
+            TransportCoverage::Unknown,
+            0,
+            false,
+            false,
+        );
+        assert!(matches!(
+            during_race.simulated_decision,
+            SimulatedDecision::ProtectUnknown | SimulatedDecision::InsufficientEvidence
+        ));
+        let lost_response = decide(
+            3,
+            "lab",
+            7,
+            9,
+            ClientState::Unknown,
+            0,
+            1,
+            false,
+            TransportCoverage::Unknown,
+            1800,
+            false,
+            false,
+        );
+        assert_eq!(
+            lost_response.simulated_decision,
+            SimulatedDecision::ProtectUnknown
+        );
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        for state in [ClientState::Active, ClientState::Idle, ClientState::Unknown] {
+            let result = decide(
+                4,
+                "lab",
+                child.id(),
+                1,
+                state,
+                0,
+                0,
+                false,
+                TransportCoverage::IncompleteByConstruction,
+                1800,
+                false,
+                false,
+            );
+            assert_ne!(
+                result.simulated_decision,
+                SimulatedDecision::WouldTerminateHeuristic
+            );
+        }
+        assert!(std::path::Path::new(&format!("/proc/{}/stat", child.id())).exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let source = include_str!("dryrun.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("pidfd_send_signal"));
+        assert!(!production.contains("Command::new(\"kill\")"));
+        assert!(!production.contains("use nix::sys::signal"));
+    }
 }

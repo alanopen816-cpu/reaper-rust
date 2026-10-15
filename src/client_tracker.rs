@@ -772,6 +772,75 @@ mod tests {
             .all(|lease| lease.active_work_evidence.is_none()));
         assert_eq!(coverage(), Coverage::Unknown);
     }
+
+    #[test]
+    fn adversarial_lease_lifecycle_and_race_remain_fail_closed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let ticks = process_start_ticks(pid).expect("lab child identity");
+        let mut leases = LeaseRegistry::new(10);
+        leases
+            .register("lab", "lab-service", pid, ticks, 100, 10)
+            .unwrap();
+        assert_eq!(leases.status("lab", 101), LeaseStatus::Active);
+        assert_eq!(
+            leases.renew("lab", 102, |_| Some(ticks)),
+            LeaseStatus::Active
+        );
+        assert!(leases.unregister("lab"));
+        assert_eq!(leases.status("lab", 103), LeaseStatus::Disconnected);
+
+        leases
+            .register("vanish", "lab-service", pid, ticks, 100, 10)
+            .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            leases.status("vanish", 110),
+            LeaseStatus::ExpiredNeedsReconcile(LeaseKnowledge::Unknown)
+        );
+        assert!(leases
+            .expired(110)
+            .iter()
+            .any(|lease| lease.client_id == "vanish" && lease.needs_reconciliation));
+        assert_eq!(coverage(), Coverage::Unknown);
+
+        // A snapshot with zero leases is not a stable authorization point: a new
+        // client can register immediately after evaluation begins.
+        let snapshot_count = leases.leases.len();
+        leases
+            .register("racing", "lab-service", pid, ticks, 111, 10)
+            .unwrap();
+        assert_eq!(snapshot_count, 2);
+        assert_eq!(leases.status("racing", 111), LeaseStatus::Active);
+    }
+
+    #[test]
+    fn stale_start_ticks_and_service_mismatch_never_reconcile_to_active() {
+        let mut leases = LeaseRegistry::new(10);
+        leases
+            .register("restart", "service-old", 99, 123, 100, 10)
+            .unwrap();
+        assert_eq!(
+            leases.renew("restart", 101, |_| Some(124)),
+            LeaseStatus::Inconsistent(LeaseKnowledge::Unknown)
+        );
+        assert_eq!(
+            leases.status("restart", 101),
+            LeaseStatus::ExpiredNeedsReconcile(LeaseKnowledge::Unknown)
+        );
+        assert_eq!(
+            leases.renew("missing-after-restart", 102, |_| Some(123)),
+            LeaseStatus::Inconsistent(LeaseKnowledge::Unknown)
+        );
+        assert_eq!(
+            leases.status("restart", 110),
+            LeaseStatus::ExpiredNeedsReconcile(LeaseKnowledge::Unknown)
+        );
+    }
     fn lab_dir(label: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

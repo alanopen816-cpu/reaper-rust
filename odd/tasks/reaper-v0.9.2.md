@@ -51,6 +51,7 @@ Mecanismo cooperativo de registro de clientes + auditoría dry-run + observabili
 - 2026-10-15: V92-T1 leases implemented and unit-tested in-module; expiry/inconsistent identity remain Unknown and require reconciliation.
 - 2026-10-15: V92-T2 added bounded read-only `/proc/<pid>/fd` socket inode observation with start-time validation and diffs; inode counts remain supplemental, never client evidence.
 - 2026-10-15: V92-T3 adds read-only pidfd compatibility probing with an optional fallback, fail-closed live identity verification, and explicit PID/starttime check-vs-signal TOCTOU documentation; probe test passed, but default test output suppresses the runtime Support variant.
+- 2026-10-15: V92-T5 in-module adversarial tests cover normal lease lifecycle, vanished child expiry, uncovered transport/race/lost-evidence protection, stale identity, and dry-run signal absence with controlled child liveness checks; permission/truncation injection remains not exercised.
 
 ## Verification evidence
 - (append per task: command → observed result, tier/outcome, commit id)
