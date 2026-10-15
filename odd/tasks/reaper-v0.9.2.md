@@ -49,6 +49,7 @@ Mecanismo cooperativo de registro de clientes + auditoría dry-run + observabili
 ## Progress
 - 2026-10-15: feature doc creado (6 tasks V92-T1..T6); branch `feature/reaper-v0.9.2` creada desde ecafb54; piloto verificado vivo pid 15157 read-only. Auditoría base: registry actual no es lease, prod no emite CompleteVerified, pilot stop path separada.
 - 2026-10-15: V92-T1 leases implemented and unit-tested in-module; expiry/inconsistent identity remain Unknown and require reconciliation.
+- 2026-10-15: V92-T2 added bounded read-only `/proc/<pid>/fd` socket inode observation with start-time validation and diffs; inode counts remain supplemental, never client evidence.
 
 ## Verification evidence
 - (append per task: command → observed result, tier/outcome, commit id)

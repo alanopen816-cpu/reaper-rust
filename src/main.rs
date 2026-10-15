@@ -24,6 +24,8 @@ mod procfs;
 mod protection;
 mod queries;
 mod relations;
+#[allow(dead_code)]
+mod socket_obs;
 mod state;
 mod stats;
 mod terminate;
